@@ -1,14 +1,14 @@
 ---
 title: "Provider Reference"
-version: 3.8.24
-lastUpdated: 2026-06-13
+version: 3.8.25
+lastUpdated: 2026-06-15
 ---
 
 # Provider Reference
 
 > **Auto-generated** from `src/shared/constants/providers.ts` — do not edit by hand.
 > Regenerate with: `npm run gen:provider-reference`
-> **Last generated:** 2026-06-13
+> **Last generated:** 2026-06-15
 
 Total providers: **226**. See category breakdown below.
 
@@ -52,7 +52,7 @@ Use the dashboard at `/dashboard/providers` to enable, configure, and test each 
 | `qoder`       | `if`         | Qoder AI             | OAuth | —                                                                         | —                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `qwen`        | `qw`         | Qwen Code            | OAuth | —                                                                         | ⚠️ **DEPRECATED.** Qwen OAuth free tier was discontinued on 2026-04-15. Use 'bailian-coding-plan', 'alibaba', 'alibaba-cn', or 'openrouter' provider with API key instead.                                                                                                                                                                                                                          |
 | `trae`        | `tr`         | Trae                 | OAuth | [link](https://trae.ai)                                                   | Trae is an AI-native IDE by ByteDance (SOLO remote agent). Authorize via trae.ai in the popup, or sign in at solo.trae.ai and paste the Cloud-IDE-JWT (sent as 'Authorization: Cloud-IDE-JWT <token>', ~14-day lifetime) as the access token; web_id/biz_user_id/user_unique_id/scope/tenant/region propagate via providerSpecificData. No headless refresh for pasted tokens — re-paste on expiry. |
-| `windsurf`    | `ws`         | Windsurf (Devin CLI) | OAuth | [link](https://windsurf.com)                                              | Sign in at windsurf.com to get your token. Visit windsurf.com/show-auth-token after logging in and paste it here, or use the device-code login flow.                                                                                                                                                                                                                                                |
+| `windsurf`    | `ws`         | Windsurf (Devin CLI) | OAuth | [link](https://windsurf.com)                                              | In the Windsurf / VS Code IDE, open the command palette and run `Windsurf: Provide Auth Token` (or click the Jupyter "Get Windsurf Authentication Token" button), then copy the shown token and paste it here. Note: opening windsurf.com/show-auth-token directly only renders a "Redirecting" page — the IDE must initiate the flow (it adds a `?state=...` param) for the token to appear.       |
 | `zed`         | `zd`         | Zed IDE              | OAuth | [link](https://zed.dev)                                                   | Zed stores LLM provider credentials (OpenAI, Anthropic, Google, Mistral, xAI) in the OS keychain. Use the Import button below to discover and import them automatically.                                                                                                                                                                                                                            |
 
 ## Web Cookie Providers (22)

@@ -17,7 +17,7 @@ test("upstream timeout config derives hidden fetch timeouts from FETCH_TIMEOUT_M
     fetchHeadersTimeoutMs: 600000,
     fetchBodyTimeoutMs: 600000,
     fetchConnectTimeoutMs: 30000,
-    fetchKeepAliveTimeoutMs: 4000,
+    fetchKeepAliveTimeoutMs: 1000,
   });
 });
 
@@ -31,6 +31,7 @@ test("REQUEST_TIMEOUT_MS becomes the common timeout baseline when specific overr
 
   assert.equal(upstreamConfig.fetchTimeoutMs, 600000);
   assert.equal(upstreamConfig.streamIdleTimeoutMs, 600000);
+  assert.equal(upstreamConfig.streamReadinessTimeoutMs, 600000);
   assert.equal(upstreamConfig.fetchHeadersTimeoutMs, 600000);
   assert.equal(upstreamConfig.fetchBodyTimeoutMs, 600000);
   assert.equal(apiBridgeConfig.proxyTimeoutMs, 600000);
@@ -42,16 +43,18 @@ test("upstream timeout config honors explicit overrides and falls back on invali
     REQUEST_TIMEOUT_MS: "550000",
     FETCH_TIMEOUT_MS: "600000",
     STREAM_IDLE_TIMEOUT_MS: "600000",
+    STREAM_READINESS_TIMEOUT_MS: "90000",
     FETCH_HEADERS_TIMEOUT_MS: "610000",
     FETCH_BODY_TIMEOUT_MS: "0",
     FETCH_CONNECT_TIMEOUT_MS: "45000",
     FETCH_KEEPALIVE_TIMEOUT_MS: "-1",
   });
 
+  assert.equal(config.streamReadinessTimeoutMs, 90000);
   assert.equal(config.fetchHeadersTimeoutMs, 610000);
   assert.equal(config.fetchBodyTimeoutMs, 0);
   assert.equal(config.fetchConnectTimeoutMs, 45000);
-  assert.equal(config.fetchKeepAliveTimeoutMs, 4000);
+  assert.equal(config.fetchKeepAliveTimeoutMs, 1000);
 });
 
 test("TLS client timeout defaults to FETCH_TIMEOUT_MS and can be overridden", () => {
