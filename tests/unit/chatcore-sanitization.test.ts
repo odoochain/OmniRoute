@@ -84,9 +84,9 @@ function ensureLegacyMemoryTable() {
   `);
 }
 
-async function waitForAsyncMemoryFlush() {
-  await new Promise((resolve) => setImmediate(resolve));
-  await new Promise((resolve) => setTimeout(resolve, 10));
+async function flushAsyncSideEffects() {
+  // setImmediate rounds drain the event loop more reliably than setTimeout under CI load.
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
 }
 
 async function invokeChatCore({
@@ -152,7 +152,7 @@ test.after(() => {
     db.close();
   } catch {}
 
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("chatCore sanitization normalizes max_output_tokens into max_tokens", async () => {
@@ -178,7 +178,7 @@ test("chatCore sanitization normalizes max_output_tokens into max_tokens", async
     },
   });
 
-  assert.equal(copied.call.body.max_tokens, 0);
+  assert.equal(copied.call.body.max_tokens, undefined);
   assert.equal("max_output_tokens" in copied.call.body, false);
   assert.equal(preserved.call.body.max_tokens, 7);
   assert.equal("max_output_tokens" in preserved.call.body, false);
@@ -437,17 +437,19 @@ test("chatCore sanitization normalizes mixed content blocks and removes unsuppor
     textBlocks.some((block) => block.text === "[draft.txt]\nDraft text"),
     true
   );
+  // Orphaned tool_result blocks (no matching tool_use anywhere in the request) are
+  // stripped by `stripOrphanedToolResults` (#5805) before reaching content normalization,
+  // to avoid strict-upstream 400s. They are therefore removed entirely — neither preserved
+  // as tool_result blocks nor inlined as "[Tool Result: …]" text.
   assert.equal(
-    textBlocks.some((block) => block.text === "[Tool Result: tool-1]\ndone"),
-    true
+    content.some((block) => block.type === "tool_result"),
+    false
   );
   assert.equal(
-    textBlocks.some((block) => block.text === "[Tool Result: tool-2]\nstructured result"),
-    true
-  );
-  assert.equal(
-    textBlocks.some((block) => block.text === '[Tool Result: tool-3]\n{"status":"ok","count":2}'),
-    true
+    textBlocks.some(
+      (block) => typeof block.text === "string" && block.text.includes("[Tool Result:")
+    ),
+    false
   );
 });
 
@@ -645,7 +647,7 @@ test("chatCore does not share or persist memories when apiKeyInfo is missing", a
     },
   });
 
-  await waitForAsyncMemoryFlush();
+  await flushAsyncSideEffects();
 
   const localMemoriesResult = await listMemories({ apiKeyId: "local" });
   const localMemories = Array.isArray(localMemoriesResult)
@@ -749,7 +751,7 @@ test("chatCore extracts memories from Claude content arrays and Responses output
 
   assert.equal(responsesResult.result.success, true);
 
-  await waitForAsyncMemoryFlush();
+  await flushAsyncSideEffects();
 
   const claudeMemoriesResult = await listMemories({ apiKeyId: claudeKeyId });
   const responsesMemoriesResult = await listMemories({ apiKeyId: responsesKeyId });
@@ -817,7 +819,7 @@ test("chatCore request memory extraction for responses input ignores assistant i
 
   assert.equal(responsesResult.result.success, true);
 
-  await waitForAsyncMemoryFlush();
+  await flushAsyncSideEffects();
 
   const memoriesResult = await listMemories({ apiKeyId: responsesKeyId });
   const memories = Array.isArray(memoriesResult) ? memoriesResult : (memoriesResult.data ?? []);

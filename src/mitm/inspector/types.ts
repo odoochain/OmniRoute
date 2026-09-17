@@ -1,18 +1,19 @@
 import { z } from "zod";
 
-export type CaptureSource = "agent-bridge" | "custom-host" | "http-proxy" | "system-proxy";
+export type CaptureSource =
+  "agent-bridge" | "custom-host" | "http-proxy" | "system-proxy" | "tproxy";
 export type DetectedKind = "llm" | "app" | "unknown";
 
 export interface InterceptedRequest {
-  id: string;                            // uuid
+  id: string; // uuid
   source: CaptureSource;
-  agent?: import("../types").AgentId;    // only when source === "agent-bridge"
-  timestamp: string;                     // ISO 8601
+  agent?: import("../types").AgentId; // only when source === "agent-bridge"
+  timestamp: string; // ISO 8601
   method: string;
   host: string;
   path: string;
   requestHeaders: Record<string, string>;
-  requestBody: string | null;            // masked
+  requestBody: string | null; // masked
   requestSize: number;
   responseHeaders: Record<string, string>;
   responseBody: string | null;
@@ -21,19 +22,21 @@ export interface InterceptedRequest {
   proxyLatencyMs?: number;
   upstreamLatencyMs?: number;
   totalLatencyMs?: number;
-  error?: string;                        // sanitized
+  error?: string; // sanitized
   sourceModel?: string | null;
   mappedModel?: string | null;
   detectedKind?: DetectedKind;
-  contextKey?: string;                   // 12-hex SHA-256 of system prompt
+  contextKey?: string; // 12-hex SHA-256 of system prompt
   annotation?: string;
   sessionId?: string;
   note?: string;
+  pid?: number; // originating process id (Linux only)
+  processName?: string; // originating process name (Linux only)
 }
 
 export const InterceptedRequestSchema = z.object({
   id: z.string().uuid(),
-  source: z.enum(["agent-bridge", "custom-host", "http-proxy", "system-proxy"]),
+  source: z.enum(["agent-bridge", "custom-host", "http-proxy", "system-proxy", "tproxy"]),
   agent: z.string().optional(),
   timestamp: z.string().datetime(),
   method: z.string(),
@@ -57,6 +60,8 @@ export const InterceptedRequestSchema = z.object({
   annotation: z.string().optional(),
   sessionId: z.string().uuid().optional(),
   note: z.string().optional(),
+  pid: z.number().int().nonnegative().optional(),
+  processName: z.string().optional(),
 });
 
 export type NormalizedBlock =
@@ -67,6 +72,13 @@ export type NormalizedBlock =
 export interface NormalizedTurn {
   role: "system" | "user" | "assistant" | "tool";
   blocks: NormalizedBlock[];
+  /** call_logs.id that produced this turn, when a caller has one to attach
+   * (e.g. linking a turn back to its source request) — absent for a plain
+   * single-request normalization. */
+  sourceCallLogId?: string;
+  /** ISO timestamp of the call_logs row that produced this turn — same
+   * scoping as sourceCallLogId. */
+  timestamp?: string;
 }
 
 export interface NormalizedConversation {

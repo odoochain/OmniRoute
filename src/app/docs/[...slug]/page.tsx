@@ -1,13 +1,11 @@
-import { source } from "@/lib/source";
-import { DocsPage, DocsBody } from "fumadocs-ui/layouts/docs/page";
 import { notFound } from "next/navigation";
-import defaultMdxComponents from "fumadocs-ui/mdx";
 import type { Metadata } from "next";
 import { cookies } from "next/headers";
 import { DEFAULT_LOCALE, LOCALE_COOKIE } from "@/i18n/config";
 import fs from "node:fs";
 import path from "node:path";
-import { marked } from "marked";
+import { resolveSafeI18nSectionDir } from "@/lib/docsI18nPath";
+import { getTranslations } from "next-intl/server";
 
 // ── Locale detection ────────────────────────────────────────────────────────
 
@@ -25,11 +23,16 @@ function getDocsLocale(): string {
 // `docs/i18n/<locale>/docs/<section>/<FILE>.md` — the exact path layout that
 // `scripts/i18n/run-translation.mjs` produces. Returns rendered HTML or null.
 
-function tryI18nFallback(slug: string[], locale: string): string | null {
+async function tryI18nFallback(slug: string[], locale: string): Promise<string | null> {
   if (!locale || locale === "en") return null;
 
+  // 🛡️ Path traversal prevention — `locale` is a user-controllable cookie, so
+  // validate segments + confine the resolved dir to docs/i18n before any fs read.
+  // Centralized in resolveSafeI18nSectionDir (pure, unit-tested).
   const docsRoot = path.resolve(process.cwd(), "docs");
-  const sectionDir = path.join(docsRoot, "i18n", locale, "docs", ...slug.slice(0, -1));
+  const sectionDir = resolveSafeI18nSectionDir(docsRoot, locale, slug);
+  if (!sectionDir) return null;
+
   if (!fs.existsSync(sectionDir)) return null;
 
   // Fumadocs lowercases slugs — match case-insensitively against i18n dir
@@ -55,18 +58,29 @@ function tryI18nFallback(slug: string[], locale: string): string | null {
       ? raw.slice(bodyMatch.index + bodyMatch[0].length).trim()
       : raw;
 
-  return marked.parse(body) as string;
+  // 🛡️ Sentinel: XSS protection via server-side sanitization of rendered markdown
+  const [{ marked }, { sanitizeDocsHtml }] = await Promise.all([
+    import("marked"),
+    import("@/lib/docsSanitizer"),
+  ]);
+  const html = marked.parse(body) as string;
+  return sanitizeDocsHtml(html);
 }
 
 // ── Page component ──────────────────────────────────────────────────────────
 
 export default async function Page(props: { params: Promise<{ slug: string[] }> }) {
   const params = await props.params;
+  const { source } = await import("../../../lib/source");
+  const [{ DocsPage, DocsBody }, defaultMdxComponents] = await Promise.all([
+    import("fumadocs-ui/layouts/docs/page"),
+    import("fumadocs-ui/mdx"),
+  ]);
   const page = source.getPage(params.slug);
   if (!page) notFound();
 
   const locale = getDocsLocale();
-  const i18nHtml = tryI18nFallback(params.slug, locale);
+  const i18nHtml = await tryI18nFallback(params.slug, locale);
 
   if (i18nHtml) {
     // Render translated markdown (non-English locale with available translation)
@@ -90,21 +104,25 @@ export default async function Page(props: { params: Promise<{ slug: string[] }> 
   );
 }
 
-// ── Static params & metadata ────────────────────────────────────────────────
+// ── Runtime metadata ───────────────────────────────────────────────────────
 
-export function generateStaticParams() {
-  return source.generateParams();
-}
+// Keep the docs route dynamic. Fumadocs' generated source includes build-only
+// metadata that Next's Bun page-data workers cannot reliably traverse during
+// generateStaticParams; rendering on request preserves the docs while keeping
+// the production build Bun-compatible.
+export const dynamic = "force-dynamic";
 
 export async function generateMetadata(props: {
   params: Promise<{ slug: string[] }>;
 }): Promise<Metadata> {
   const params = await props.params;
+  const { source } = await import("../../../lib/source");
   const page = source.getPage(params.slug);
   if (!page) return {};
+  const t = await getTranslations("docs");
 
   return {
-    title: `${page.data.title} — OmniRoute Docs`,
-    description: page.data.description ?? `OmniRoute documentation: ${page.data.title}`,
+    title: t("pageMetadataTitle", { title: page.data.title }),
+    description: page.data.description ?? t("pageMetadataDescription", { title: page.data.title }),
   };
 }

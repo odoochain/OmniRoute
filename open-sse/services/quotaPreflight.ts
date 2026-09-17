@@ -18,6 +18,10 @@
  * it — once you invoke preflight, it runs the fetcher and evaluates.
  */
 
+import { isCompatibleProviderConnectionId } from "@/shared/utils/compatibleProviderId";
+import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
+import { fetchNewApiAggregatorQuota } from "./newApiAggregatorQuotaFetcher.ts";
+
 export interface PreflightQuotaResult {
   proceed: boolean;
   reason?: string;
@@ -44,6 +48,8 @@ export interface QuotaInfo {
    * (e.g. "session", "weekly", "monthly").
    */
   windows?: Record<string, QuotaWindowInfo>;
+  /** True when the upstream usage endpoint explicitly reports exhausted quota. */
+  limitReached?: boolean;
 }
 
 export type QuotaFetcher = (
@@ -140,6 +146,118 @@ function isRemainingAtOrBelowThreshold(
   return remainingPercent <= thresholdPercent + REMAINING_PERCENT_EPSILON;
 }
 
+function exhaustedResult(quotaPercent: number, resetAt: string | null): PreflightQuotaResult {
+  return {
+    proceed: false,
+    reason: "quota_exhausted",
+    quotaPercent,
+    resetAt,
+  };
+}
+
+function limitReachedResult(quota: QuotaInfo): PreflightQuotaResult {
+  return exhaustedResult(
+    Number.isFinite(quota.percentUsed) ? quota.percentUsed : 1,
+    quota.resetAt ?? null
+  );
+}
+
+function quotaWindowCutoffResult(
+  windows: NonNullable<QuotaInfo["windows"]>,
+  thresholds?: PreflightQuotaThresholds
+): PreflightQuotaResult | null {
+  let worstUsedPercent = 0;
+  let worstWindow: string | null = null;
+  let worstResetAt: string | null = null;
+
+  for (const [windowName, windowInfo] of Object.entries(windows)) {
+    if (!Number.isFinite(windowInfo.percentUsed)) continue;
+    const minRemainingPercent = resolveOrDefault(
+      thresholds?.resolveMinRemainingPercent,
+      windowName,
+      DEFAULT_MIN_REMAINING_PERCENT
+    );
+    if (
+      !isRemainingAtOrBelowThreshold(
+        remainingPercentFrom(windowInfo.percentUsed),
+        minRemainingPercent
+      )
+    ) {
+      continue;
+    }
+    if (windowInfo.percentUsed <= worstUsedPercent && worstWindow !== null) continue;
+    worstUsedPercent = windowInfo.percentUsed;
+    worstWindow = windowName;
+    worstResetAt = windowInfo.resetAt ?? null;
+  }
+
+  return worstWindow === null ? null : exhaustedResult(worstUsedPercent, worstResetAt);
+}
+
+function quotaPercentCutoffResult(
+  quota: QuotaInfo,
+  thresholds?: PreflightQuotaThresholds
+): PreflightQuotaResult {
+  if (!Number.isFinite(quota.percentUsed)) return { proceed: true };
+
+  const minRemainingPercent = resolveOrDefault(
+    thresholds?.resolveMinRemainingPercent,
+    null,
+    DEFAULT_MIN_REMAINING_PERCENT
+  );
+  const remainingPercent = remainingPercentFrom(quota.percentUsed);
+  return isRemainingAtOrBelowThreshold(remainingPercent, minRemainingPercent)
+    ? exhaustedResult(quota.percentUsed, quota.resetAt ?? null)
+    : { proceed: true, quotaPercent: quota.percentUsed };
+}
+
+/**
+ * Pure cutoff evaluator used by routing paths that already fetched quota.
+ * Mirrors preflightQuota threshold semantics without performing I/O or logging.
+ */
+export function evaluateQuotaCutoff(
+  quota: QuotaInfo | null | undefined,
+  thresholds?: PreflightQuotaThresholds
+): PreflightQuotaResult {
+  if (!quota) return { proceed: true };
+  if (quota.limitReached === true) return limitReachedResult(quota);
+
+  const windows = quota.windows;
+  if (windows && Object.keys(windows).length > 0) {
+    return (
+      quotaWindowCutoffResult(windows, thresholds) ?? {
+        proceed: true,
+        quotaPercent: quota.percentUsed,
+      }
+    );
+  }
+
+  return quotaPercentCutoffResult(quota, thresholds);
+}
+
+/**
+ * Resolve a dynamic quota fetcher for compatible-provider connections that
+ * opt in to New-API / One-API / Sub2API aggregator balance detection.
+ * Returns the fetcher when both the feature flag and the connection's
+ * aggregator flag are true; otherwise returns undefined.
+ */
+export function resolveDynamicQuotaFetcher(
+  provider: string,
+  connection: Record<string, unknown>
+): QuotaFetcher | undefined {
+  // Dynamic dispatch only for compatible-provider connection IDs
+  if (!isCompatibleProviderConnectionId(provider)) return undefined;
+
+  // Connection must opt in via providerSpecificData.newApiAggregatorBalance
+  const psd = connection?.providerSpecificData as Record<string, unknown> | undefined;
+  if (!psd || psd.newApiAggregatorBalance !== true) return undefined;
+
+  // Feature flag must be enabled
+  if (!isFeatureFlagEnabled("NEWAPI_AGGREGATOR_BALANCE")) return undefined;
+
+  return fetchNewApiAggregatorQuota;
+}
+
 export async function preflightQuota(
   provider: string,
   connectionId: string,
@@ -148,9 +266,14 @@ export async function preflightQuota(
 ): Promise<PreflightQuotaResult> {
   // No legacy enable-flag gate here — the caller decides when to invoke us
   // (see file-level docstring). When there's no fetcher we proceed silently.
-  const fetcher = getQuotaFetcher(provider);
+  let fetcher = getQuotaFetcher(provider);
   if (!fetcher) {
-    return { proceed: true };
+    // Dynamic fallback: for compatible-provider connections with the
+    // aggregator flag + feature flag, use the generalized New-API fetcher.
+    fetcher = resolveDynamicQuotaFetcher(provider, connection);
+    if (!fetcher) {
+      return { proceed: true };
+    }
   }
 
   let quota: QuotaInfo | null = null;
@@ -162,6 +285,10 @@ export async function preflightQuota(
 
   if (!quota) {
     return { proceed: true };
+  }
+
+  if (quota.limitReached === true) {
+    return limitReachedResult(quota);
   }
 
   // Per-window evaluation — only when the fetcher surfaces a windows map.

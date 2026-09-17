@@ -38,6 +38,22 @@ export const CLI_TOKEN_HEADER = "x-omniroute-cli-token";
 export const PEER_IP_HEADER = "x-omniroute-peer-ip";
 
 /**
+ * Trusted "request arrived via a reverse proxy" marker stamped by the custom
+ * Node server alongside PEER_IP_HEADER, formatted as `<token>|1` when the
+ * inbound TCP request carried forwarding headers (`x-forwarded-for` /
+ * `x-real-ip`) and `<token>|0` otherwise. The middleware combines this with
+ * the stamped peer IP so a loopback / private-LAN socket that is actually the
+ * proxy hop (e.g. OmniRoute behind nginx / Caddy / Cloudflare Tunnel) is NOT
+ * trusted as local — closing the upstream da667836 vulnerability that would
+ * otherwise let a leaked JWT over a public tunnel reach LOCAL_ONLY routes
+ * that spawn child processes. Token-validated like PEER_IP_HEADER, so a
+ * remote caller cannot forge it. Stripped from forwarded headers before
+ * route handlers see it.
+ * Keep in sync with VIA_PROXY_HEADER in scripts/dev/peer-stamp.mjs.
+ */
+export const VIA_PROXY_HEADER = "x-omniroute-via-proxy";
+
+/**
  * Trusted locality verdict ("loopback" | "lan" | "remote") that the pipeline
  * computes from the stamped real peer IP and forwards to route handlers. Route
  * code (e.g. cliTokenAuth) reads THIS instead of re-deriving locality from the
@@ -45,6 +61,16 @@ export const PEER_IP_HEADER = "x-omniroute-peer-ip";
  * client input and re-set by the pipeline, so a remote caller cannot forge it.
  */
 export const AUTHZ_HEADER_PEER_LOCALITY = "x-omniroute-peer-locality";
+
+/**
+ * The resolved real peer IP, stamped by the pipeline AFTER verifying the
+ * token-stamped PEER_IP_HEADER. This is the trusted, non-spoofable IP that
+ * route handlers (e.g. login rate-limit key) should use instead of re-deriving
+ * from X-Forwarded-For / X-Real-IP. Set only when the stamp token is configured
+ * and the HMAC signature validates; absent when the stamp is not in use.
+ * Stripped from incoming requests like all other trusted headers.
+ */
+export const AUTHZ_HEADER_TRUSTED_PEER_IP = "x-omniroute-trusted-peer-ip";
 
 /**
  * Headers the pipeline must NEVER trust on incoming requests. They are
@@ -57,4 +83,5 @@ export const AUTHZ_TRUSTED_HEADERS: ReadonlyArray<string> = [
   AUTHZ_HEADER_AUTH_LABEL,
   AUTHZ_HEADER_AUTH_SCOPES,
   AUTHZ_HEADER_PEER_LOCALITY,
+  AUTHZ_HEADER_TRUSTED_PEER_IP,
 ];

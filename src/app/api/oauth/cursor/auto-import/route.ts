@@ -1,96 +1,6 @@
 import { NextResponse } from "next/server";
-import { homedir } from "os";
-import { join } from "path";
-import { readFile } from "fs/promises";
-import { isAuthRequired, isAuthenticated } from "@/shared/utils/apiAuth";
-
-/**
- * Try to read credentials from cursor-agent's auth.json
- * (written by `cursor-agent` CLI after login).
- */
-async function tryAgentAuth(): Promise<{
-  found: boolean;
-  accessToken?: string;
-  source?: string;
-  error?: string;
-}> {
-  try {
-    const authPath = join(homedir(), ".config", "cursor", "auth.json");
-    const raw = await readFile(authPath, "utf-8");
-    const auth = JSON.parse(raw);
-    if (auth.accessToken && typeof auth.accessToken === "string") {
-      return { found: true, accessToken: auth.accessToken, source: "cursor-agent" };
-    }
-    return { found: false, error: "cursor-agent auth.json has no accessToken" };
-  } catch {
-    return { found: false, error: "cursor-agent auth.json not found" };
-  }
-}
-
-/**
- * Try to read credentials from Cursor IDE's state.vscdb
- */
-async function tryIdeAuth(): Promise<{
-  found: boolean;
-  accessToken?: string;
-  machineId?: string;
-  source?: string;
-  error?: string;
-}> {
-  const platform = process.platform;
-  let dbPath;
-
-  if (platform === "darwin") {
-    dbPath = join(homedir(), "Library/Application Support/Cursor/User/globalStorage/state.vscdb");
-  } else if (platform === "linux") {
-    dbPath = join(homedir(), ".config/Cursor/User/globalStorage/state.vscdb");
-  } else if (platform === "win32") {
-    dbPath = join(process.env.APPDATA || "", "Cursor/User/globalStorage/state.vscdb");
-  } else {
-    return { found: false, error: "Unsupported platform" };
-  }
-
-  let db;
-  try {
-    const { tryOpenSync } = await import("@/lib/db/adapters/driverFactory");
-    db = tryOpenSync(dbPath, { readonly: true, fileMustExist: true });
-    if (!db) return { found: false, error: "Cursor IDE database driver unavailable" };
-  } catch {
-    return { found: false, error: "Cursor IDE database not found" };
-  }
-
-  try {
-    const rows = db
-      .prepare("SELECT key, value FROM itemTable WHERE key IN (?, ?)")
-      .all("cursorAuth/accessToken", "storage.serviceMachineId") as {
-      key: string;
-      value: string;
-    }[];
-
-    const tokens: Record<string, string> = {};
-    for (const row of rows) {
-      if (row.key === "cursorAuth/accessToken") tokens.accessToken = row.value;
-      else if (row.key === "storage.serviceMachineId") tokens.machineId = row.value;
-    }
-
-    db.close();
-
-    if (!tokens.accessToken) {
-      return { found: false, error: "Tokens not found in database" };
-    }
-
-    return {
-      found: true,
-      accessToken: tokens.accessToken,
-      machineId: tokens.machineId,
-      source: "cursor-ide",
-    };
-  } catch (error) {
-    db?.close();
-    console.error("Failed to read Cursor IDE database:", error);
-    return { found: false, error: "Failed to read database" };
-  }
-}
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { tryAgentAuth, tryIdeAuth } from "@/lib/cursor/tokenExtractor";
 
 /**
  * GET /api/oauth/cursor/auto-import
@@ -101,11 +11,9 @@ async function tryIdeAuth(): Promise<{
  * 🔒 Auth-guarded: requires JWT cookie or Bearer API key (finding #258-4).
  */
 export async function GET(request: Request) {
-  if (await isAuthRequired(request)) {
-    if (!(await isAuthenticated(request))) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-  }
+  // GHSA-mg76 / GHSA-gxv4: reading/importing host credentials is a management action.
+  const authError = await requireManagementAuth(request, { invalidApiKeyStatus: 401 });
+  if (authError) return authError;
 
   try {
     // Try Cursor IDE first (has both accessToken and machineId)
@@ -114,6 +22,7 @@ export async function GET(request: Request) {
       return NextResponse.json({
         found: true,
         accessToken: ideResult.accessToken,
+        refreshToken: ideResult.refreshToken,
         machineId: ideResult.machineId,
         source: ideResult.source,
       });

@@ -1,8 +1,6 @@
 import { setTimeout as sleep } from "node:timers/promises";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { resolveDataDir } from "./data-dir.mjs";
 import { getCliToken, CLI_TOKEN_HEADER } from "./utils/cliToken.mjs";
+import { resolveActiveContext, resolveActiveContextAsync } from "./contexts.mjs";
 
 export const RETRY_DEFAULTS = Object.freeze({
   maxAttempts: 3,
@@ -28,14 +26,12 @@ export function getBaseUrl(opts = {}) {
   const envUrl = process.env.OMNIROUTE_BASE_URL;
   if (envUrl) return stripTrailingSlash(envUrl);
 
+  // Resolve from the active context (canonical store + legacy profile fallback).
+  // This is what makes "remote mode" work: `omniroute contexts use <remote>`
+  // routes every command at the remote server's baseUrl.
   try {
-    const configPath = join(resolveDataDir(), "config.json");
-    if (existsSync(configPath)) {
-      const cfg = JSON.parse(readFileSync(configPath, "utf8"));
-      const profile = cfg.activeProfile && cfg.profiles?.[cfg.activeProfile];
-      if (profile?.baseUrl) return stripTrailingSlash(profile.baseUrl);
-      if (cfg.baseUrl) return stripTrailingSlash(cfg.baseUrl);
-    }
+    const ctx = resolveActiveContext(opts.context ?? process.env.OMNIROUTE_CONTEXT);
+    if (ctx?.baseUrl) return stripTrailingSlash(ctx.baseUrl);
   } catch {
     // Config read failures are not fatal — fall through to default.
   }
@@ -56,20 +52,65 @@ function resolveUrl(path, opts) {
   return `${getBaseUrl(opts)}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
-async function buildHeaders(opts) {
+/** The machine-derived token is valid only for the local loopback server. */
+export function isLoopbackUrl(value) {
+  try {
+    const hostname = new URL(value).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    if (hostname === "localhost" || hostname === "::1") return true;
+    if (/^127(?:\.[0-9]{1,3}){3}$/.test(hostname)) return true;
+    if (/^::ffff:(?:127\.|7f[0-9a-f]{2}:)/i.test(hostname)) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+export async function buildHeaders(opts) {
   const headers = new Headers(opts.headers || {});
   if (!headers.has("accept")) headers.set("accept", "application/json");
   if (opts.body && !headers.has("content-type") && typeof opts.body !== "string") {
     headers.set("content-type", "application/json");
   }
-  const apiKey = opts.apiKey ?? process.env.OMNIROUTE_API_KEY;
-  if (apiKey && !headers.has("authorization")) {
-    headers.set("authorization", `Bearer ${apiKey}`);
+  // Auth precedence: explicit key → active-context credential → ambient env key.
+  //
+  // The active context's scoped token MUST win over the ambient OMNIROUTE_API_KEY:
+  // `omniroute connect <remote>` saves the context's token, but users keep
+  // OMNIROUTE_API_KEY in their shell. The global `--api-key` option is bound to
+  // that env var (.env("OMNIROUTE_API_KEY")), so commands that spread
+  // `optsWithGlobals()` into apiFetch carry opts.apiKey === the env value. If that
+  // echoed value outranked the context, every remote management command would send
+  // the local inference key and fail with "Invalid management token" — defeating
+  // remote mode. So an opts.apiKey that merely mirrors the ambient env var is
+  // treated as ambient (a fallback), NOT as an explicit override; only a DISTINCT
+  // key — a real `--api-key <x>` flag or a command-supplied token like
+  // `connect --key` — counts as explicit and wins. Within a context the scoped
+  // accessToken wins over the legacy apiKey.
+  const ambientKey = process.env.OMNIROUTE_API_KEY || null;
+  const explicitKey = opts.apiKey && opts.apiKey !== ambientKey ? opts.apiKey : null;
+  let auth = explicitKey;
+  if (!auth) {
+    try {
+      const ctx = await resolveActiveContextAsync(opts.context ?? process.env.OMNIROUTE_CONTEXT);
+      auth = ctx?.accessToken || ctx?.apiKey || null;
+    } catch {
+      // No context credential available — fall through to the ambient fallback.
+    }
   }
-  // Inject machine-id derived CLI token; env var override for testing.
-  const cliToken = opts.cliToken ?? process.env.OMNIROUTE_CLI_TOKEN ?? (await getCliToken());
-  if (cliToken && !headers.has(CLI_TOKEN_HEADER)) {
-    headers.set(CLI_TOKEN_HEADER, cliToken);
+  if (!auth) auth = opts.apiKey || ambientKey || null;
+  if (auth && !headers.has("authorization")) {
+    headers.set("authorization", `Bearer ${auth}`);
+  }
+  // Inject the machine-derived credential only for an explicit local loopback
+  // destination. Remote contexts and absolute remote URLs use scoped access
+  // tokens and must never receive this machine-bound local credential.
+  const destinationUrl = opts.destinationUrl ?? getBaseUrl(opts);
+  if (!isLoopbackUrl(destinationUrl)) {
+    headers.delete(CLI_TOKEN_HEADER);
+  } else {
+    const cliToken = opts.cliToken ?? process.env.OMNIROUTE_CLI_TOKEN ?? (await getCliToken());
+    if (cliToken && !headers.has(CLI_TOKEN_HEADER)) {
+      headers.set(CLI_TOKEN_HEADER, cliToken);
+    }
   }
   if (opts.idempotencyKey && !headers.has("idempotency-key")) {
     headers.set("idempotency-key", opts.idempotencyKey);
@@ -118,6 +159,21 @@ export function shouldRetryError(err, opts = {}) {
   return false;
 }
 
+/**
+ * True when a non-2xx status means "this server does not serve this route"
+ * rather than "your request was wrong".
+ *
+ * Commands that keep a local SQLite fallback must not treat these as fatal:
+ * a CLI newer (or older) than the server it is talking to will hit routes that
+ * simply are not mounted, and aborting there strands the user with an
+ * unactionable `HTTP 404` even though the local path would have worked.
+ * Genuine client errors (400/401/403/409/422 …) stay fatal — retrying them
+ * locally would paper over a real problem.
+ */
+export function isRouteUnavailableStatus(status) {
+  return status === 404 || status === 405 || status === 501;
+}
+
 export function statusToExitCode(status) {
   if (status >= 200 && status < 300) return 0;
   if (status === 408) return 124;
@@ -159,8 +215,12 @@ function fetchOnce(url, init, timeoutMs) {
 export async function apiFetch(path, opts = {}) {
   const method = String(opts.method || "GET").toUpperCase();
   const url = resolveUrl(path, opts);
-  const headers = await buildHeaders(opts);
+  const headers = await buildHeaders({ ...opts, destinationUrl: url });
   const body = serializeBody(opts.body, headers);
+  // Undici preserves custom headers across cross-origin redirects. A local server
+  // redirect must never turn the loopback machine credential into an outbound
+  // secret, so fail redirects whenever this header is present.
+  const redirect = headers.has(CLI_TOKEN_HEADER) ? "error" : opts.redirect;
   const timeout =
     opts.timeout ?? (Number.parseInt(process.env.OMNIROUTE_HTTP_TIMEOUT_MS || "", 10) || 30000);
   const maxAttempts = opts.retry === false ? 1 : (opts.retryMax ?? RETRY_DEFAULTS.maxAttempts);
@@ -169,7 +229,7 @@ export async function apiFetch(path, opts = {}) {
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const res = await fetchOnce(url, { method, headers, body }, timeout);
+      const res = await fetchOnce(url, { method, headers, body, redirect }, timeout);
       if (res.ok) return enrichResponse(res, opts);
       if (attempt < maxAttempts && shouldRetryStatus(res.status, method, opts)) {
         const delay = computeBackoff(attempt, res.headers.get("retry-after"));

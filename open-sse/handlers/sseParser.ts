@@ -244,10 +244,8 @@ export function parseSSEToOpenAIResponse(rawSSE, fallbackModel) {
             existing.index = tc.index;
           }
           if (tc?.function?.name && !existing.function?.name) {
-            existing.function = existing.function || {};
             existing.function.name = tc.function.name;
           }
-          existing.function = existing.function || {};
           existing.function.arguments = appendToolCallArgumentDelta(
             existing.function.arguments,
             deltaArgs
@@ -370,8 +368,7 @@ export function parseSSEToClaudeResponse(rawSSE, fallbackModel) {
           type: "thinking",
           index,
           thinking: toString(contentBlock.thinking),
-          signature:
-            typeof contentBlock.signature === "string" ? contentBlock.signature : undefined,
+          signature: toString(contentBlock.signature) || undefined,
         });
       } else if (blockType === "tool_use") {
         blocks.set(index, {
@@ -416,12 +413,17 @@ export function parseSSEToClaudeResponse(rawSSE, fallbackModel) {
         continue;
       }
 
-      if (deltaType === "thinking_delta" || typeof delta.thinking === "string") {
+      const isThinkingDelta = deltaType === "thinking_delta" || typeof delta.thinking === "string";
+      const isSignatureDelta =
+        deltaType === "signature_delta" || typeof delta.signature === "string";
+      if (isThinkingDelta || isSignatureDelta) {
         const thinking =
           existing && existing.type === "thinking"
             ? existing
             : { type: "thinking", index, thinking: "", signature: undefined };
-        thinking.thinking += toString(delta.thinking);
+        if (isThinkingDelta) thinking.thinking += toString(delta.thinking);
+        const signature = toString(delta.signature);
+        if (signature) thinking.signature = `${thinking.signature || ""}${signature}`;
         blocks.set(index, thinking);
         continue;
       }
@@ -454,35 +456,27 @@ export function parseSSEToClaudeResponse(rawSSE, fallbackModel) {
 
   if (!sawClaudeEvent) return null;
 
-  const content = [...blocks.values()]
-    .sort((a, b) => a.index - b.index)
-    .flatMap((block) => {
-      if (block.type === "text") {
-        return block.text ? [{ type: "text", text: block.text }] : [];
+  const content = [];
+  for (const block of [...blocks.values()].sort((a, b) => a.index - b.index)) {
+    if (block.type === "text") {
+      if (block.text) content.push({ type: "text", text: block.text });
+      continue;
+    }
+    if (block.type === "thinking") {
+      const hasSignature = typeof block.signature === "string" && block.signature.length > 0;
+      if (block.thinking || hasSignature) {
+        content.push({
+          type: "thinking",
+          thinking: block.thinking || "",
+          ...(hasSignature ? { signature: block.signature } : {}),
+        });
       }
-      if (block.type === "thinking") {
-        return block.thinking
-          ? [
-              {
-                type: "thinking",
-                thinking: block.thinking,
-                ...(block.signature ? { signature: block.signature } : {}),
-              },
-            ]
-          : [];
-      }
+      continue;
+    }
 
-      const parsedInput =
-        block.inputJson.trim().length > 0 ? tryParseJson(block.inputJson) : block.input;
-      return [
-        {
-          type: "tool_use",
-          id: block.id,
-          name: block.name,
-          input: parsedInput,
-        },
-      ];
-    });
+    const input = block.inputJson.trim().length > 0 ? tryParseJson(block.inputJson) : block.input;
+    content.push({ type: "tool_use", id: block.id, name: block.name, input });
+  }
 
   return {
     id: messageId || `msg_${Date.now()}`,
@@ -715,11 +709,18 @@ export function parseSSEToResponsesOutput(rawSSE, fallbackModel) {
         toIdString(evt.item_id)
       );
       const summary = Array.isArray(reasoningItem.summary) ? reasoningItem.summary : [];
-      const firstPart =
-        summary.length > 0 ? { ...toRecord(summary[0]) } : { type: "summary_text", text: "" };
-      firstPart.type = firstPart.type || "summary_text";
-      firstPart.text = `${toString(firstPart.text)}${toString(evt.delta)}`;
-      summary[0] = firstPart;
+      // #9500 — respect summary_index: each segment is a distinct summary_text
+      // part. Place deltas at summary[summary_index] (growing the array) so
+      // segments are preserved for later "\n\n" joining on the non-stream path,
+      // instead of overwriting summary[0] regardless of index.
+      const summaryIndex = typeof evt.summary_index === "number" ? evt.summary_index : 0;
+      const part =
+        summary[summaryIndex] && typeof summary[summaryIndex] === "object"
+          ? { ...toRecord(summary[summaryIndex]) }
+          : { type: "summary_text", text: "" };
+      part.type = part.type || "summary_text";
+      part.text = `${toString(part.text)}${toString(evt.delta)}`;
+      summary[summaryIndex] = part;
       reasoningItem.summary = summary;
     }
 
@@ -730,11 +731,15 @@ export function parseSSEToResponsesOutput(rawSSE, fallbackModel) {
         toIdString(evt.item_id)
       );
       const summary = Array.isArray(reasoningItem.summary) ? reasoningItem.summary : [];
-      const firstPart =
-        summary.length > 0 ? { ...toRecord(summary[0]) } : { type: "summary_text", text: "" };
-      firstPart.type = firstPart.type || "summary_text";
-      firstPart.text = toString(evt.text, toString(firstPart.text));
-      summary[0] = firstPart;
+      // #9500 — respect summary_index on the terminal done event too.
+      const summaryIndex = typeof evt.summary_index === "number" ? evt.summary_index : 0;
+      const part =
+        summary[summaryIndex] && typeof summary[summaryIndex] === "object"
+          ? { ...toRecord(summary[summaryIndex]) }
+          : { type: "summary_text", text: "" };
+      part.type = part.type || "summary_text";
+      part.text = toString(evt.text, toString(part.text));
+      summary[summaryIndex] = part;
       reasoningItem.summary = summary;
     }
 
@@ -778,6 +783,24 @@ export function parseSSEToResponsesOutput(rawSSE, fallbackModel) {
     .map(([, item]) => item)
     .filter((item) => item && typeof item === "object");
   const pickedOutput = Array.isArray(picked.output) ? picked.output : [];
+  // #3948 — A Responses-API terminal snapshot (`response.completed`) can carry a
+  // non-empty `output` that LACKS the assistant message item (e.g. only a
+  // `reasoning` item) even though the streamed `output_text` deltas reconstructed
+  // a full message. Preferring such a textless terminal output drops the
+  // assistant text → empty content on `stream:false` (n8n combo). When the
+  // terminal output has no message item but the reconstructed delta output does,
+  // use the reconstructed output (a superset carrying the message). The terminal
+  // snapshot still wins whenever it already contains the message item.
+  const outputHasMessage = (items: unknown[]) =>
+    items.some((item) => toRecord(item).type === "message");
+  const chosenOutput =
+    pickedOutput.length > 0 &&
+    !outputHasMessage(pickedOutput) &&
+    outputHasMessage(reconstructedOutput)
+      ? reconstructedOutput
+      : pickedOutput.length > 0
+        ? pickedOutput
+        : reconstructedOutput;
   const statusFallback =
     terminalEventType === "response.cancelled"
       ? "cancelled"
@@ -795,7 +818,7 @@ export function parseSSEToResponsesOutput(rawSSE, fallbackModel) {
     id: picked.id != null ? String(picked.id) : `resp_${Date.now()}`,
     object: picked.object || "response",
     model: picked.model || fallbackModel || "unknown",
-    output: (pickedOutput.length > 0 ? pickedOutput : reconstructedOutput).map((item) => {
+    output: chosenOutput.map((item) => {
       const record = toRecord(item);
       return {
         ...record,

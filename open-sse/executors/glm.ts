@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { KeyHealth } from "../services/apiKeyRotator.ts";
 
 import { DefaultExecutor } from "./default.ts";
 import {
@@ -19,6 +20,7 @@ import {
   getGlmTransport,
 } from "../config/glmProvider.ts";
 import { applyProviderRequestDefaults } from "../services/providerRequestDefaults.ts";
+import { stripUnsupportedParams } from "../translator/paramSupport.ts";
 import { getRotatingApiKey } from "../services/apiKeyRotator.ts";
 import { CLAUDE_CLI_STAINLESS_PACKAGE_VERSION } from "../config/anthropicHeaders.ts";
 import {
@@ -32,6 +34,7 @@ import { FORMATS } from "../translator/formats.ts";
 import { createSSETransformStreamWithLogger } from "../utils/stream.ts";
 import { ensureStreamReadiness } from "../utils/streamReadiness.ts";
 import { STREAM_READINESS_TIMEOUT_MS } from "../config/constants.ts";
+import { resolveSuppressThinkClose, THINKING_MARKER_HEADER } from "../utils/thinkCloseMarker.ts";
 
 type JsonRecord = Record<string, unknown>;
 type GlmExecuteResult = Awaited<ReturnType<DefaultExecutor["execute"]>> & {
@@ -49,6 +52,68 @@ function getEffectiveKey(credentials: ProviderCredentials): string {
   }
   return credentials.apiKey || credentials.accessToken || "";
 }
+
+export type GlmEffortLevel = "low" | "high" | "max";
+
+type GlmEffortTier = {
+  baseModel: string;
+  effort: GlmEffortLevel;
+  /** Transport where the upstream honors the effort selector for this family. */
+  transport: GlmTransport;
+};
+
+/**
+ * GLM-5.2 effort tiers (glm-5.2-high/-max) route exclusively through the
+ * Anthropic transport, where Zhipu maps Claude Code effort selectors (high/max)
+ * to reasoning intensity. The base model ID sent upstream is always "glm-5.2".
+ *
+ * GLM-5.3 replaced tier endpoints with a documented `reasoning_effort` request
+ * parameter (low|high|max, default max) on the coding chat/completions endpoint,
+ * so its tiers stay on the OpenAI transport and inject `reasoning_effort` +
+ * `thinking.type=enabled` (5.3 no longer accepts thinking disabled).
+ *
+ * https://docs.z.ai/devpack/latest-model
+ * https://docs.z.ai/guides/llm/glm-5.3
+ */
+function parseGlmEffortTier(model: string): GlmEffortTier | null {
+  switch (model) {
+    case "glm-5.2-high":
+      return { baseModel: "glm-5.2", effort: "high", transport: "anthropic" };
+    case "glm-5.2-max":
+      return { baseModel: "glm-5.2", effort: "max", transport: "anthropic" };
+    case "glm-5.3-high":
+      return { baseModel: "glm-5.3", effort: "high", transport: "openai" };
+    case "glm-5.3-low":
+      return { baseModel: "glm-5.3", effort: "low", transport: "openai" };
+    case "glm-5.3-max":
+      return { baseModel: "glm-5.3", effort: "max", transport: "openai" };
+    default:
+      return null;
+  }
+}
+
+/**
+ * Detects GLM models that support deep thinking (5.2+).
+ * These models share a single max_tokens budget for reasoning + response
+ * (Z.AI does not document a separate thinking budget). When the client
+ * doesn't explicitly request max_tokens, we default to the model's full
+ * output capacity so reasoning isn't truncated by a low generic default.
+ *
+ * To add future models (e.g. glm-5.3, glm-5.4), just extend the regex.
+ * https://docs.z.ai/guides/overview/concept-param
+ */
+const GLM_THINKING_MODEL_PATTERN = /^glm-5\.(?:[2-9]|\d{2,})/i;
+
+function isGlmThinkingModel(model: string): boolean {
+  return GLM_THINKING_MODEL_PATTERN.test(model);
+}
+
+/**
+ * Z.AI's official max output for GLM-5.2+ is 131072 tokens (128K).
+ * This budget covers BOTH reasoning and the final response.
+ * https://z.ai/blog/glm-5.2
+ */
+const GLM_THINKING_DEFAULT_MAX_TOKENS = 131072;
 
 function applyGlmRequestDefaults(body: unknown, defaults?: JsonRecord | null): unknown {
   const record = asRecord(body);
@@ -144,7 +209,12 @@ function translateAnthropicJsonError(parsed: unknown): JsonRecord {
   };
 }
 
-function translateSseResponse(response: Response, provider: string, model: string): Response {
+export function translateSseResponse(
+  response: Response,
+  provider: string,
+  model: string,
+  suppressThinkClose: boolean = false
+): Response {
   if (!response.body) return response;
   const transform = createSSETransformStreamWithLogger(
     FORMATS.CLAUDE,
@@ -152,7 +222,14 @@ function translateSseResponse(response: Response, provider: string, model: strin
     provider,
     null,
     null,
-    model
+    model,
+    null,
+    null,
+    null,
+    null,
+    null,
+    false,
+    suppressThinkClose
   );
   const headers = cloneHeaders(response.headers);
   headers.set("content-type", "text/event-stream");
@@ -194,8 +271,10 @@ export class GlmExecutor extends DefaultExecutor {
     stream = true,
     _clientHeaders?: Record<string, string> | null,
     _model?: string,
-    transport: GlmTransport = getGlmTransport(credentials.providerSpecificData)
+    _health?: unknown,
+    _body?: unknown
   ): Record<string, string> {
+    const transport: GlmTransport = getGlmTransport(credentials.providerSpecificData);
     if (transport === "openai") {
       return buildGlmCodingHeaders(getEffectiveKey(credentials), stream);
     }
@@ -228,27 +307,92 @@ export class GlmExecutor extends DefaultExecutor {
     credentials: ProviderCredentials,
     transport: GlmTransport
   ) {
-    const transformed = this.transformRequest(model, body, stream, credentials);
+    const effortTier = parseGlmEffortTier(model);
+    const effectiveModel = effortTier ? effortTier.baseModel : model;
+
+    const transformed = this.transformRequest(effectiveModel, body, stream, credentials);
+    const record = asRecord(transformed);
+
+    // #7364: unlike DefaultExecutor.execute() (default.ts), GlmExecutor.execute()
+    // never calls the base execute() loop — it drives its own fetch via
+    // executeTransport()/transformForTransport() — so stripUnsupportedParams()
+    // (normally applied at default.ts's execute() call site) never ran for GLM
+    // requests. Without this call, a STRIP_RULES clamp entry for provider "glm"
+    // (e.g. the glm-4.6v max_tokens ceiling) would be silently dead code.
+    if (record) stripUnsupportedParams(this.provider, effectiveModel, record);
+
+    // Ensure upstream receives the base model ID, not the effort-suffixed alias
+    if (record && effortTier) {
+      record.model = effectiveModel;
+    }
+
+    // GLM-5.2+ models share a single max_tokens budget for reasoning + response.
+    // When the client doesn't explicitly set max_tokens, default to the model's
+    // full output capacity (131072) so deep reasoning isn't truncated by the
+    // generic translator defaults (64000 for Anthropic, 16384 for OpenAI).
+    // This acts as the "transparent proxy override" described in Z.AI's own
+    // Terminal-Bench evaluation methodology.
+    // https://huggingface.co/blog/zai-org/glm-52-blog
+    if (record && isGlmThinkingModel(effectiveModel)) {
+      const clientBody = asRecord(body);
+      const clientMaxTokens = clientBody?.max_tokens ?? clientBody?.max_completion_tokens;
+      if (!clientMaxTokens) {
+        record.max_tokens = GLM_THINKING_DEFAULT_MAX_TOKENS;
+      }
+    }
 
     if (transport === "openai") {
-      const record = asRecord(transformed);
+      // GLM-5.3 effort tiers: inject the documented `reasoning_effort` param and
+      // force thinking on — 5.3 rejects thinking.type "disabled", and an effort
+      // tier without thinking would silently drop the selector upstream.
+      if (record && effortTier && effortTier.transport === "openai") {
+        const existingThinking = asRecord(record.thinking);
+        record.thinking = { ...existingThinking, type: "enabled" };
+        record.reasoning_effort = effortTier.effort;
+      }
       if (record && stream && hasTools(record) && record.tool_stream === undefined) {
         return { ...record, tool_stream: true };
       }
       return transformed;
     }
 
-    return translateRequest(
+    const translated = translateRequest(
       FORMATS.OPENAI,
       FORMATS.CLAUDE,
-      model,
-      { ...(transformed as JsonRecord), _disableToolPrefix: true },
+      effectiveModel,
+      { ...(record ?? {}), _disableToolPrefix: true },
       stream,
       credentials,
       this.provider,
       null,
       { preserveCacheControl: false }
     );
+
+    // Inject effort and thinking for the Anthropic transport.
+    // Zhipu's Anthropic endpoint requires thinking.type=enabled to emit
+    // thinking_delta blocks in the SSE response. Without it, reasoning is
+    // not surfaced and clients see no thinking content.
+    // The effort-2025-11-24 beta header (in GLM_ANTHROPIC_BETA) carries
+    // the high/max intensity selector.
+    if (effortTier) {
+      const translatedRecord = asRecord(translated);
+      if (translatedRecord) {
+        translatedRecord.effort = effortTier.effort;
+        // Zhipu's Anthropic endpoint only supports thinking.type
+        // "enabled"/"disabled" — not "adaptive". Clients like Claude Code
+        // default to "adaptive" for reasoning models, so force "enabled"
+        // here while preserving any other fields (e.g. budget_tokens).
+        const existingThinking = asRecord(translatedRecord.thinking);
+        if (!existingThinking || existingThinking.type !== "enabled") {
+          translatedRecord.thinking = {
+            ...existingThinking,
+            type: "enabled",
+          };
+        }
+      }
+    }
+
+    return translated;
   }
 
   private async executeTransport(
@@ -257,13 +401,24 @@ export class GlmExecutor extends DefaultExecutor {
   ): Promise<GlmExecuteResult> {
     const credentials = input.credentials;
     const url = buildGlmChatUrl(credentials?.providerSpecificData, transport, this.config.baseUrl);
-    const headers = this.buildHeaders(
-      credentials,
-      input.stream,
-      input.clientHeaders,
-      input.model,
-      transport
-    );
+    // #10798 moved the transport out of buildHeaders' signature; the Anthropic
+    // transport must therefore be visible to buildHeaders through
+    // providerSpecificData (primaryTransport / anthropic-shaped baseUrl).
+    const headers =
+      transport === "anthropic"
+        ? this.buildHeaders(
+            {
+              ...credentials,
+              providerSpecificData: {
+                ...credentials?.providerSpecificData,
+                primaryTransport: "anthropic",
+              },
+            },
+            input.stream,
+            input.clientHeaders,
+            input.model
+          )
+        : this.buildHeaders(credentials, input.stream, input.clientHeaders, input.model);
     applyConfiguredUserAgent(headers, credentials.providerSpecificData);
     mergeUpstreamExtraHeaders(headers, input.upstreamExtraHeaders);
 
@@ -294,6 +449,7 @@ export class GlmExecutor extends DefaultExecutor {
 
     let response: Response;
     try {
+      this.assertOutboundUrlAllowed(url); // GHSA-4f49: glm has its own fetch path
       response = await fetch(url, {
         method: "POST",
         headers,
@@ -317,20 +473,7 @@ export class GlmExecutor extends DefaultExecutor {
     const result = { response, url, headers, transformedBody };
 
     if (transport === "anthropic") {
-      const translatedResponse =
-        input.stream && result.response.ok
-          ? translateSseResponse(result.response, this.provider, input.model)
-          : isJsonResponse(result.response)
-            ? await translateAnthropicJsonResponse(result.response)
-            : result.response;
-      return {
-        ...result,
-        response: translatedResponse,
-        url,
-        headers,
-        transformedBody,
-        targetFormat: FORMATS.OPENAI,
-      };
+      return this.finalizeAnthropicTransportResult(input, result);
     }
 
     return {
@@ -342,7 +485,60 @@ export class GlmExecutor extends DefaultExecutor {
     };
   }
 
+  /**
+   * GLM's Anthropic transport does its own Claude→OpenAI translation
+   * (bypassing chatCore's stream), so the `</think>` close-marker
+   * suppression flag and the response translation both have to be resolved
+   * here from the original client headers (#5245 / #5312). Extracted from
+   * `executeTransport` to keep that method's cyclomatic complexity under the
+   * project cap.
+   */
+  private async finalizeAnthropicTransportResult(
+    input: ExecuteInput,
+    result: {
+      response: Response;
+      url: string;
+      headers: Record<string, string>;
+      transformedBody: unknown;
+    }
+  ): Promise<GlmExecuteResult> {
+    const { response: rawResponse, url, headers, transformedBody } = result;
+    const clientHeaders = input.clientHeaders ?? {};
+    const suppressThinkClose = resolveSuppressThinkClose({
+      userAgent: clientHeaders["user-agent"] ?? clientHeaders["User-Agent"] ?? null,
+      thinkingMarkerHeader:
+        clientHeaders[THINKING_MARKER_HEADER] ??
+        clientHeaders["x-omniroute-thinking-marker"] ??
+        null,
+      clientResponseFormat: input.clientResponseFormat ?? null,
+    });
+
+    const translatedResponse =
+      input.stream && rawResponse.ok
+        ? translateSseResponse(rawResponse, this.provider, input.model, suppressThinkClose)
+        : isJsonResponse(rawResponse)
+          ? await translateAnthropicJsonResponse(rawResponse)
+          : rawResponse;
+    return {
+      response: translatedResponse,
+      url,
+      headers,
+      transformedBody,
+      targetFormat: FORMATS.OPENAI,
+    };
+  }
+
   async execute(input: ExecuteInput): Promise<GlmExecuteResult> {
+    const effortTier = parseGlmEffortTier(input.model);
+
+    // Effort tiers route directly through their family's transport (no fallback):
+    // GLM-5.2 → Anthropic (Zhipu only graduates effort there, via the
+    // effort-2025-11-24 beta header in GLM_ANTHROPIC_BETA); GLM-5.3 → OpenAI
+    // coding endpoint (`reasoning_effort` param). See parseGlmEffortTier.
+    if (effortTier) {
+      return this.executeTransport(input, effortTier.transport);
+    }
+
     const primaryTransport = getGlmTransport(
       input.credentials.providerSpecificData,
       this.config.baseUrl

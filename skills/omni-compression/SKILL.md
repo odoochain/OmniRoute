@@ -20,7 +20,7 @@ Preview compression for a message payload
 
 ```bash
 curl -X POST https://localhost:20128/api/compression/preview \
-  -H "Authorization: Bearer $OMNIROUTE_TOKEN"
+  -H "Authorization: Bearer $OMNIROUTE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{}'
 ```
@@ -45,7 +45,7 @@ curl https://localhost:20128/api/compression/rules \
 
 ## Payloads
 
-See the full OpenAPI specification at `GET /api/openapi/spec` or `docs/reference/openapi.yaml` for detailed request/response schemas.
+See the full OpenAPI specification at `GET /api/openapi/spec` or `docs/openapi.yaml` for detailed request/response schemas.
 
 <!-- skill:custom-start -->
 <!-- Migrated from skills/omniroute-compression/SKILL.md (preserved curated content) -->

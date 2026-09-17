@@ -10,15 +10,16 @@ import { Badge, Button, Toggle } from "@/shared/components";
 import { pickDisplayValue } from "@/shared/utils/maskEmail";
 import useEmailPrivacyStore from "@/store/emailPrivacyStore";
 import { isClaudeExtraUsageBlockEnabled } from "@/lib/providers/claudeExtraUsage";
+import { shouldShowConnectionLastError } from "./connectionRowHelpers";
 import {
   getCodexEffectiveServiceTier,
   type CodexGlobalServiceMode,
 } from "@/lib/providers/codexFastTier";
-import {
-  normalizeCodexLimitPolicy,
-  providerText,
-  ERROR_TYPE_LABELS,
-} from "../providerPageHelpers";
+import { normalizeCodexLimitPolicy, providerText, ERROR_TYPE_LABELS } from "../providerPageHelpers";
+import { getCodexPlanLabel } from "../codexPlanLabel";
+import type { CodexAccountPoolProjection } from "@omniroute/open-sse/services/codexAccount/index.ts";
+import CodexAccountDetails from "./CodexAccountDetails";
+import ProviderQuotaVisibilityToggle from "./ProviderQuotaVisibilityToggle";
 
 // ---------------------------------------------------------------------------
 // Types (exported so the client can reference them without re-importing)
@@ -26,6 +27,7 @@ import {
 
 export interface ConnectionRowConnection {
   id?: string;
+  provider?: string;
   name?: string;
   email?: string;
   displayName?: string;
@@ -40,12 +42,15 @@ export interface ConnectionRowConnection {
   errorCode?: string | number;
   globalPriority?: number;
   providerSpecificData?: Record<string, unknown>;
+  defaultModel?: string | null;
   expiresAt?: string;
   tokenExpiresAt?: string;
   maxConcurrent?: number | null;
   authType?: string;
   proxyEnabled?: boolean;
   perKeyProxyEnabled?: boolean;
+  quotaVisible?: boolean;
+  codexAccountPool?: CodexAccountPoolProjection;
 }
 
 export interface ConnectionRowProps {
@@ -53,7 +58,6 @@ export interface ConnectionRowProps {
   isOAuth: boolean;
   isClaude?: boolean;
   isCodex?: boolean;
-  isGeminiCli?: boolean;
   codexGlobalServiceMode?: CodexGlobalServiceMode;
   isFirst: boolean;
   isLast: boolean;
@@ -63,12 +67,21 @@ export interface ConnectionRowProps {
   onMoveDown: () => void;
   onToggleActive: (isActive?: boolean) => void | Promise<void>;
   onToggleRateLimit: (enabled?: boolean) => void;
+  onToggleQuotaVisibility?: (visible: boolean) => void;
   onToggleClaudeExtraUsage?: (enabled?: boolean) => void;
+  onToggleAutoSync?: (enabled: boolean) => void;
   onToggleCodex5h?: (enabled?: boolean) => void;
   onToggleCodexWeekly?: (enabled?: boolean) => void;
   isCcCompatible?: boolean;
   cliproxyapiEnabled?: boolean;
   onToggleCliproxyapiMode?: (enabled?: boolean) => void;
+  /** Provider-level upstream proxy routing mode (native/CLIProxyAPI/Dario/fallback). */
+  upstreamProxyMode?: "native" | "cliproxyapi" | "dario" | "fallback";
+  upstreamProxyFallbackBackend?: "cliproxyapi" | "dario";
+  onSetUpstreamProxyMode?: (
+    mode: "native" | "cliproxyapi" | "dario" | "fallback",
+    fallbackBackend?: "cliproxyapi" | "dario"
+  ) => void;
   onRetest: () => void;
   isRetesting?: boolean;
   onEdit: () => void;
@@ -78,6 +91,7 @@ export interface ConnectionRowProps {
   hasProxy?: boolean;
   proxySource?: string;
   proxyHost?: string;
+  proxyName?: string | null;
   proxyEnabled?: boolean;
   perKeyProxyEnabled?: boolean;
   onToggleProxyEnabled?: (enabled: boolean) => void;
@@ -92,10 +106,6 @@ export interface ConnectionRowProps {
   isApplyingClaudeAuthLocal?: boolean;
   onExportClaudeAuthFile?: () => void;
   isExportingClaudeAuthFile?: boolean;
-  onApplyGeminiAuthLocal?: () => void;
-  isApplyingGeminiAuthLocal?: boolean;
-  onExportGeminiAuthFile?: () => void;
-  isExportingGeminiAuthFile?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +253,7 @@ function getStatusPresentation(
   if (errorType === "account_deactivated") {
     return {
       statusVariant: "error",
-      statusLabel: t("statusDeactivated", "Deactivated"),
+      statusLabel: providerText(t, "statusDeactivated", "Deactivated"),
       errorType,
       errorBadge,
       errorTextClass: "text-red-600 font-bold",
@@ -298,7 +308,7 @@ function getStatusPresentation(
   if (errorType === "banned") {
     return {
       statusVariant: "error",
-      statusLabel: t("statusBanned", "Banned (403)"),
+      statusLabel: providerText(t, "statusBanned", "Banned (403)"),
       errorType,
       errorBadge,
       errorTextClass: "text-red-600 font-bold",
@@ -308,7 +318,7 @@ function getStatusPresentation(
   if (errorType === "credits_exhausted") {
     return {
       statusVariant: "warning",
-      statusLabel: t("statusCreditsExhausted", "Out of Credits"),
+      statusLabel: providerText(t, "statusCreditsExhausted", "Out of Credits"),
       errorType,
       errorBadge,
       errorTextClass: "text-amber-500",
@@ -339,10 +349,12 @@ export default function ConnectionRow({
   isOAuth,
   isClaude,
   isCodex,
-  isGeminiCli,
   codexGlobalServiceMode,
   isCcCompatible,
   cliproxyapiEnabled,
+  upstreamProxyMode,
+  upstreamProxyFallbackBackend,
+  onSetUpstreamProxyMode,
   isFirst,
   isLast,
   isSelected,
@@ -351,7 +363,9 @@ export default function ConnectionRow({
   onMoveDown,
   onToggleActive,
   onToggleRateLimit,
+  onToggleQuotaVisibility,
   onToggleClaudeExtraUsage,
+  onToggleAutoSync,
   onToggleCodex5h,
   onToggleCodexWeekly,
   onToggleCliproxyapiMode,
@@ -364,6 +378,7 @@ export default function ConnectionRow({
   hasProxy,
   proxySource,
   proxyHost,
+  proxyName,
   onRefreshToken,
   isRefreshing,
   onApplyCodexAuthLocal,
@@ -374,10 +389,6 @@ export default function ConnectionRow({
   isApplyingClaudeAuthLocal,
   onExportClaudeAuthFile,
   isExportingClaudeAuthFile,
-  onApplyGeminiAuthLocal,
-  isApplyingGeminiAuthLocal,
-  onExportGeminiAuthFile,
-  isExportingGeminiAuthFile,
   perKeyProxyEnabled,
   onTogglePerKeyProxyEnabled,
   proxyEnabled,
@@ -392,31 +403,10 @@ export default function ConnectionRow({
         t("oauthAccount")
       )
     : connection.name;
-  const applyCodexAuthLabel =
-    typeof t.has === "function" && t.has("applyCodexAuthLocal")
-      ? t("applyCodexAuthLocal")
-      : "Apply auth";
-  const exportCodexAuthLabel =
-    typeof t.has === "function" && t.has("exportCodexAuthFile")
-      ? t("exportCodexAuthFile")
-      : "Export auth";
-  const applyClaudeAuthLabel =
-    typeof t.has === "function" && t.has("applyClaudeAuthLocal")
-      ? t("applyClaudeAuthLocal")
-      : "Apply auth";
-  const exportClaudeAuthLabel =
-    typeof t.has === "function" && t.has("exportClaudeAuthFile")
-      ? t("exportClaudeAuthFile")
-      : "Export auth";
-  const applyGeminiAuthLabel =
-    typeof t.has === "function" && t.has("applyGeminiAuthLocal")
-      ? t("applyGeminiAuthLocal")
-      : "Apply auth";
-  const exportGeminiAuthLabel =
-    typeof t.has === "function" && t.has("exportGeminiAuthFile")
-      ? t("exportGeminiAuthFile")
-      : "Export auth";
-
+  const applyCodexAuthLabel = providerText(t, "applyCodexAuthLocal", "Apply auth");
+  const exportCodexAuthLabel = providerText(t, "exportCodexAuthFile", "Export auth");
+  const applyClaudeAuthLabel = providerText(t, "applyClaudeAuthLocal", "Apply auth");
+  const exportClaudeAuthLabel = providerText(t, "exportClaudeAuthFile", "Export auth");
   // Use useState + useEffect for impure Date.now() to avoid calling during render
   const [isCooldown, setIsCooldown] = useState(false);
   // T12: token expiry status — lazy init avoids calling Date.now() during render;
@@ -464,6 +454,7 @@ export default function ConnectionRow({
 
   const statusPresentation = getStatusPresentation(connection, effectiveStatus, isCooldown, t);
   const rateLimitEnabled = !!connection.rateLimitProtection;
+  const quotaVisible = connection.quotaVisible !== false;
   const codexPolicy =
     connection.providerSpecificData &&
     typeof connection.providerSpecificData === "object" &&
@@ -521,7 +512,14 @@ export default function ConnectionRow({
   const claudeBlockExtraUsageEnabled = isClaude
     ? isClaudeExtraUsageBlockEnabled("claude", connection.providerSpecificData)
     : false;
-  const cliproxyapiDeepMode = !!cliproxyapiEnabled;
+  const codexPlanLabel = getCodexPlanLabel(!!isCodex, connection.providerSpecificData);
+  // #dario: this control is now a full mode selector (native/CLIProxyAPI/
+  // Dario/fallback), not a binary toggle — cliproxyapiEnabled/
+  // onToggleCliproxyapiMode are kept on the props interface for any other
+  // consumer but are no longer read here.
+  const effectiveUpstreamProxyMode = upstreamProxyMode ?? "native";
+  const autoSyncEnabled = !!(connection.providerSpecificData as Record<string, unknown> | undefined)
+    ?.autoSync;
 
   return (
     <div
@@ -562,16 +560,27 @@ export default function ConnectionRow({
             <Badge variant={statusPresentation.statusVariant as any} size="sm" dot>
               {statusPresentation.statusLabel}
             </Badge>
+            {codexPlanLabel && (
+              <Badge variant="primary" size="sm" className="capitalize">
+                {codexPlanLabel}
+              </Badge>
+            )}
             {/* T12: Token expiry status indicator (state-driven, no Date.now in render) */}
+            {/* #5836: the red "Token Expired" badge is TERMINAL-only — for OAuth
+               refresh-capable providers (Antigravity/Gemini) the access token lapses
+               ~hourly but is auto-refreshed, so a lapsed token alone must not paint
+               red. Gate it on testStatus === "expired" (continuation of #5326). */}
             {tokenMinsLeft !== null &&
               (tokenMinsLeft < 0 ? (
-                <span
-                  className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-xs font-medium bg-red-500/15 text-red-500"
-                  title={t("tokenExpiredTitle", { date: effectiveExpiresAt })}
-                >
-                  <span className="material-symbols-outlined text-[11px]">error</span>
-                  {t("tokenExpiredBadge")}
-                </span>
+                connection.testStatus === "expired" ? (
+                  <span
+                    className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-xs font-medium bg-red-500/15 text-red-500"
+                    title={t("tokenExpiredTitle", { date: effectiveExpiresAt })}
+                  >
+                    <span className="material-symbols-outlined text-[11px]">error</span>
+                    {t("tokenExpiredBadge")}
+                  </span>
+                ) : null
               ) : tokenMinsLeft < 30 ? (
                 <span
                   className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-xs font-medium bg-amber-500/15 text-amber-500"
@@ -589,7 +598,7 @@ export default function ConnectionRow({
                 {t(statusPresentation.errorBadge.labelKey)}
               </Badge>
             )}
-            {connection.lastError && connection.isActive !== false && (
+            {shouldShowConnectionLastError(connection) && (
               <span
                 className={`text-xs truncate max-w-[300px] ${statusPresentation.errorTextClass}`}
                 title={connection.lastError}
@@ -628,6 +637,30 @@ export default function ConnectionRow({
               <span className="material-symbols-outlined text-[13px]">shield</span>
               {rateLimitEnabled ? t("rateLimitProtected") : t("rateLimitUnprotected")}
             </button>
+            {onToggleQuotaVisibility && (
+              <ProviderQuotaVisibilityToggle
+                visible={quotaVisible}
+                onToggle={onToggleQuotaVisibility}
+              />
+            )}
+            {onToggleAutoSync && (
+              <>
+                <span className="text-text-muted/30 select-none">|</span>
+                <button
+                  onClick={() => onToggleAutoSync?.(!autoSyncEnabled)}
+                  disabled={connection.isActive === false}
+                  className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+                    autoSyncEnabled
+                      ? "bg-emerald-500/15 text-emerald-500 hover:bg-emerald-500/25"
+                      : "bg-black/[0.03] dark:bg-white/[0.03] text-text-muted/50 hover:text-text-muted hover:bg-black/[0.06] dark:hover:bg-white/[0.06]"
+                  }`}
+                  title={t("autoSyncTooltip")}
+                >
+                  <span className="material-symbols-outlined text-[13px]">sync</span>
+                  {t("autoSyncShort")}
+                </button>
+              </>
+            )}
             {isClaude && (
               <>
                 <span className="text-text-muted/30 select-none">|</span>
@@ -646,21 +679,47 @@ export default function ConnectionRow({
                 </button>
               </>
             )}
-            {isCcCompatible && (
+            {/* #dario: upstream proxy routing selector. Gated on isClaude (the
+                real, built-in "claude" provider — the primary intended use
+                case for CLIProxyAPI/Dario failover) OR isCcCompatible (a
+                custom Claude-Code-protocol-compatible node). Previously this
+                only checked isCcCompatible, which never covered the built-in
+                Claude provider at all — the control was unreachable for the
+                one connection type it was actually built for. */}
+            {(isClaude || isCcCompatible) && (
               <>
                 <span className="text-text-muted/30 select-none">|</span>
-                <button
-                  onClick={() => onToggleCliproxyapiMode?.(!cliproxyapiDeepMode)}
-                  className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium transition-all cursor-pointer ${
-                    cliproxyapiDeepMode
-                      ? "bg-indigo-500/15 text-indigo-500 hover:bg-indigo-500/25"
-                      : "bg-black/[0.03] dark:bg-white/[0.03] text-text-muted/50 hover:text-text-muted hover:bg-black/[0.06] dark:hover:bg-white/[0.06]"
-                  }`}
-                  title={cliproxyapiDeepMode ? t("cpaModeEnabledTitle") : t("cpaModeDisabledTitle")}
+                <select
+                  value={effectiveUpstreamProxyMode}
+                  onChange={(e) =>
+                    onSetUpstreamProxyMode?.(
+                      e.target.value as "native" | "cliproxyapi" | "dario" | "fallback"
+                    )
+                  }
+                  className="text-xs font-medium rounded px-1.5 py-0.5 border-0 bg-black/[0.03] dark:bg-white/[0.03] text-text-muted/70 hover:text-text-muted cursor-pointer focus:outline-none focus:ring-1 focus:ring-primary/30"
+                  title="Upstream proxy routing for Claude Code traffic"
                 >
-                  <span className="material-symbols-outlined text-[13px]">swap_horiz</span>
-                  CPA {cliproxyapiDeepMode ? t("toggleOnShort") : t("toggleOffShort")}
-                </button>
+                  <option value="native">Native</option>
+                  <option value="cliproxyapi">CLIProxyAPI</option>
+                  <option value="dario">Dario</option>
+                  <option value="fallback">Fallback</option>
+                </select>
+                {effectiveUpstreamProxyMode === "fallback" && (
+                  <select
+                    value={upstreamProxyFallbackBackend ?? "cliproxyapi"}
+                    onChange={(e) =>
+                      onSetUpstreamProxyMode?.(
+                        "fallback",
+                        e.target.value as "cliproxyapi" | "dario"
+                      )
+                    }
+                    className="text-xs font-medium rounded px-1.5 py-0.5 border-0 bg-black/[0.03] dark:bg-white/[0.03] text-text-muted/70 hover:text-text-muted cursor-pointer focus:outline-none focus:ring-1 focus:ring-primary/30"
+                    title="Fallback retry backend"
+                  >
+                    <option value="cliproxyapi">→ CLIProxyAPI</option>
+                    <option value="dario">→ Dario</option>
+                  </select>
+                )}
               </>
             )}
             {isCodex && (
@@ -776,7 +835,7 @@ export default function ConnectionRow({
                       })}
                     >
                       <span className="material-symbols-outlined text-[13px]">vpn_lock</span>
-                      {proxyHost || t("proxy")}
+                      {proxyName || proxyHost || t("proxy")}
                     </span>
                   </>
                 );
@@ -868,41 +927,13 @@ export default function ConnectionRow({
             {exportClaudeAuthLabel}
           </Button>
         )}
-        {isGeminiCli && onApplyGeminiAuthLocal && (
-          <Button
-            size="sm"
-            variant="ghost"
-            icon="install_desktop"
-            loading={isApplyingGeminiAuthLocal}
-            disabled={isApplyingGeminiAuthLocal}
-            onClick={onApplyGeminiAuthLocal}
-            className="!h-7 !px-2 text-xs text-emerald-500 hover:text-emerald-400"
-            title={applyGeminiAuthLabel}
-          >
-            {applyGeminiAuthLabel}
-          </Button>
-        )}
-        {isGeminiCli && onExportGeminiAuthFile && (
-          <Button
-            size="sm"
-            variant="ghost"
-            icon="download"
-            loading={isExportingGeminiAuthFile}
-            disabled={isExportingGeminiAuthFile}
-            onClick={onExportGeminiAuthFile}
-            className="!h-7 !px-2 text-xs text-sky-500 hover:text-sky-400"
-            title={exportGeminiAuthLabel}
-          >
-            {exportGeminiAuthLabel}
-          </Button>
-        )}
         <Toggle
           size="sm"
           checked={connection.isActive ?? true}
           onChange={onToggleActive}
           title={(connection.isActive ?? true) ? t("disableConnection") : t("enableConnection")}
         />
-        <div className="flex gap-1 ml-1 transition-opacity">
+        <div className="flex gap-1 ms-1 transition-opacity">
           {onReauth && (
             <button
               onClick={onReauth}
@@ -935,6 +966,9 @@ export default function ConnectionRow({
           </button>
         </div>
       </div>
+      {isCodex && connection.codexAccountPool ? (
+        <CodexAccountDetails pool={connection.codexAccountPool} />
+      ) : null}
     </div>
   );
 }

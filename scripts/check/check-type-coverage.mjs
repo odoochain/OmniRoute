@@ -11,8 +11,12 @@
 //   - Rationale: the only tsconfig that covers the full open-sse workspace
 //     (src+open-sse together). `tsconfig.json` excludes open-sse; the
 //     `tsconfig.typecheck-core.json` only lists 26 explicit files (partial).
-//     open-sse/tsconfig.json sets `baseUrl: ".."` and path aliases so it
-//     resolves both workspaces correctly and yields a representative global %.
+//     open-sse/tsconfig.json declares path aliases (`@/*`, `@omniroute/open-sse/*`)
+//     relative to its own directory, so it resolves both workspaces correctly and
+//     yields a representative global %. It carried a `baseUrl: ".."` until TS 7
+//     readiness removed it; that also stopped `electron/*.js` from being pulled
+//     into the program via root-relative resolution, which moved the measured %
+//     up (~92.2% -> ~94.0%).
 //
 // Direction: up (% can only improve; ratchet blocks drops once wired into INT).
 // Eps: 0.05 (float noise tolerance — type-coverage may vary by ~0.01% between runs).
@@ -33,7 +37,7 @@ const UPDATE = process.argv.includes("--update");
 const BASELINE_PATH = path.resolve(
   process.argv.includes("--baseline")
     ? process.argv[process.argv.indexOf("--baseline") + 1]
-    : path.join(ROOT, "quality-baseline.json")
+    : path.join(ROOT, "config/quality/quality-baseline.json")
 );
 
 // Small epsilon to absorb float noise between runs (type-coverage can vary ~0.01%).

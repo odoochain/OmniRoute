@@ -29,6 +29,8 @@ import os from "node:os";
 
 import { printHeading, printInfo, printSuccess, printError } from "../io.mjs";
 import { t } from "../i18n.mjs";
+import { resolveActiveContext } from "../contexts.mjs";
+import { guardHostConfigTarget } from "../utils/config-home-guard.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -44,8 +46,7 @@ const PACKAGE_ROOT = resolve(__dirname, "..", "..", "..");
 // (see root package.json `files`: ["@omniroute/", ...]). The env override
 // exists so tests can point at a fixture without building the real plugin.
 const BUNDLED_PLUGIN_DIR =
-  process.env.OMNIROUTE_OPENCODE_PLUGIN_DIR ||
-  join(PACKAGE_ROOT, "@omniroute", "opencode-plugin");
+  process.env.OMNIROUTE_OPENCODE_PLUGIN_DIR || join(PACKAGE_ROOT, "@omniroute", "opencode-plugin");
 
 /**
  * Resolve the OpenCode config directory. Honours XDG_CONFIG_HOME and the
@@ -89,7 +90,7 @@ function resolveOpenCodeDirs() {
  *     a clear error instead of running tsup here, because the CLI runtime
  *     may not have tsup available (it's a devDependency).
  *
- * @returns {{ distEntry: string, cjsEntry: string, packageDir: string }}
+ * @returns {{ distEntry: string, packageDir: string }}
  */
 function resolveBundledPlugin() {
   if (!existsSync(BUNDLED_PLUGIN_DIR)) {
@@ -102,17 +103,17 @@ function resolveBundledPlugin() {
   }
 
   const esmEntry = join(BUNDLED_PLUGIN_DIR, "dist", "index.js");
-  const cjsEntry = join(BUNDLED_PLUGIN_DIR, "dist", "index.cjs");
 
-  if (!existsSync(esmEntry) || !existsSync(cjsEntry)) {
+  if (!existsSync(esmEntry)) {
     throw new Error(
       `@omniroute/opencode-plugin dist/ not built (looked for ${esmEntry}).\n` +
         `Run \`cd ${BUNDLED_PLUGIN_DIR} && npm install && npm run build\` and re-run this command.`
     );
   }
 
-  // Prefer ESM. OpenCode (≥1.15) loads ESM modules natively.
-  return { distEntry: esmEntry, cjsEntry, packageDir: BUNDLED_PLUGIN_DIR };
+  // ESM-only build (CJS was dropped in tsup config). OpenCode (>=1.15) loads
+  // ESM modules natively.
+  return { distEntry: esmEntry, packageDir: BUNDLED_PLUGIN_DIR };
 }
 
 /**
@@ -218,18 +219,56 @@ function registerPluginInOpenCodeConfig({
  * a clear "could not run opencode" message instead of a hard import
  * failure.
  */
-function runOpenCodeAuth(providerId) {
-  const isWin = process.platform === "win32";
-  const opencodeBin = isWin ? "opencode.cmd" : "opencode";
-  const res = spawnSync(opencodeBin, ["auth", "login", "--provider", providerId], {
-    stdio: "inherit",
-    shell: false,
-  });
+/**
+ * Resolve the provider id used for `opencode auth login --provider <id>`.
+ *
+ * The bundled @omniroute/opencode-plugin registers its provider under
+ * `opencode-<id>` (the `opencode-` prefix is required by OpenCode >=1.17.8's
+ * native-adapter gate). The auth login command must use the prefixed form
+ * because OpenCode resolves `--provider <id>` against the provider id the
+ * plugin actually registered.
+ *
+ * Idempotent: if the id already starts with `opencode-`, it passes through
+ * unchanged. This protects users who manually worked around the bug with
+ * `--provider opencode-omniroute`.
+ *
+ * @param {string} providerId
+ * @returns {string}
+ */
+export function resolveOpenCodeAuthProviderId(providerId) {
+  return providerId.startsWith("opencode-") ? providerId : `opencode-${providerId}`;
+}
+
+/**
+ * Pure resolver for the `opencode auth login` spawn descriptor. Extracted so the
+ * platform-branching logic is unit-testable without mocking child_process or
+ * mutating process.platform.
+ *
+ * On Windows the `opencode` binary is an npm `.cmd` shim that Node's hardened
+ * spawnSync (post CVE-2024-27980) refuses to run without a shell — spawning it
+ * with shell:false throws EINVAL (#7913). Mirror the same fix already applied to
+ * codex (resolveCodexSpawn in launch-codex.mjs, crediting #6263) and
+ * qodercli/Auggie (#6263/#6304): shell:true on win32, shell:false everywhere else.
+ */
+export function resolveOpenCodeAuthSpawn(providerId, platform = process.platform) {
+  const isWin = platform === "win32";
+  const authProviderId = resolveOpenCodeAuthProviderId(providerId);
+  return {
+    command: isWin ? "opencode.cmd" : "opencode",
+    args: ["auth", "login", "--provider", authProviderId],
+    options: { stdio: "inherit", shell: isWin },
+  };
+}
+
+export function runOpenCodeAuth(providerId) {
+  const authProviderId = resolveOpenCodeAuthProviderId(providerId);
+  const { command, args, options } = resolveOpenCodeAuthSpawn(providerId);
+  const res = spawnSync(command, args, options);
   if (res.error) {
     // ENOENT = opencode is not on PATH
     if (res.error.code === "ENOENT") {
       printInfo(
-        `opencode CLI not found on PATH. Run \`opencode auth login --provider ${providerId}\` manually after installing OpenCode.`
+        `opencode CLI not found on PATH. Run \`opencode auth login --provider ${authProviderId}\` manually after installing OpenCode.`
       );
       return 1;
     }
@@ -255,7 +294,17 @@ function runOpenCodeAuth(providerId) {
  */
 export async function runSetupOpenCodeCommand(opts = {}) {
   const providerId = opts.providerId || "omniroute";
-  const baseURL = opts.baseURL || opts.baseUrl || "http://localhost:20128";
+  // Remote-aware: explicit --remote/--base-url → active context → localhost.
+  let baseURL = opts.remote || opts.baseURL || opts.baseUrl;
+  if (!baseURL) {
+    try {
+      const ctx = resolveActiveContext(opts.context ?? process.env.OMNIROUTE_CONTEXT);
+      baseURL = ctx?.baseUrl;
+    } catch {
+      /* no context */
+    }
+  }
+  if (!baseURL) baseURL = "http://localhost:20128";
   const displayName = opts.displayName || null;
   const wantsAuth = Boolean(opts.auth);
   const nonInteractive = Boolean(opts.nonInteractive);
@@ -267,6 +316,13 @@ export async function runSetupOpenCodeCommand(opts = {}) {
   const opencodeDataDir = resolvedDirs.dataDir;
   printInfo(`OpenCode config dir: ${opencodeConfigDir}`);
   printInfo(`OpenCode data dir:   ${opencodeDataDir}`);
+
+  const guard = await guardHostConfigTarget(opencodeConfigDir, {
+    toolLabel: "OpenCode",
+    hostCommand: "omniroute setup opencode",
+    allowContainerWrite: Boolean(opts.allowContainerWrite ?? opts["allow-container-write"]),
+  });
+  if (guard !== 0) return { exitCode: guard };
 
   // 1. Resolve bundled plugin
   let pluginInfo;
@@ -317,7 +373,8 @@ export async function runSetupOpenCodeCommand(opts = {}) {
   if (wantsAuth) {
     if (nonInteractive) {
       printInfo(`Skipping \`opencode auth login\` (non-interactive mode).`);
-      printInfo(`Run manually: opencode auth login --provider ${providerId}`);
+      const authProviderId = resolveOpenCodeAuthProviderId(providerId);
+      printInfo(`Run manually: opencode auth login --provider ${authProviderId}`);
     } else {
       printHeading("Authenticating with OpenCode");
       const authExit = runOpenCodeAuth(providerId);
@@ -326,8 +383,9 @@ export async function runSetupOpenCodeCommand(opts = {}) {
       }
     }
   } else {
+    const authProviderId = resolveOpenCodeAuthProviderId(providerId);
     printInfo(
-      `Next step: opencode auth login --provider ${providerId}   (pass --auth to do this automatically)`
+      `Next step: opencode auth login --provider ${authProviderId}   (pass --auth to do this automatically)`
     );
   }
 
@@ -357,8 +415,11 @@ export function registerSetupOpenCode(setupCommand) {
     )
     .option(
       "--base-url <url>",
-      "OmniRoute base URL the plugin should talk to (default: http://localhost:20128)",
-      "http://localhost:20128"
+      "OmniRoute base URL the plugin should talk to (default: active context or http://localhost:20128)"
+    )
+    .option(
+      "--remote <url>",
+      "Remote OmniRoute URL, e.g. http://192.168.0.15:20128 (overrides --base-url and the context)"
     )
     .option("--display-name <name>", "Display name in the OpenCode UI (optional)")
     .option(
@@ -367,6 +428,10 @@ export function registerSetupOpenCode(setupCommand) {
       false
     )
     .option("--non-interactive", "Do not prompt; skip the auth login step", false)
+    .option(
+      "--allow-container-write",
+      "Write even when the target is inside a container and not mounted from the host"
+    )
     .action(async (opts, cmd) => {
       // The parent `setup` command uses cmd.optsWithGlobals(); we mirror
       // that here so global flags (--json, --base-url, --api-key) still
@@ -377,6 +442,7 @@ export function registerSetupOpenCode(setupCommand) {
         output: globalOpts.output,
         apiKey: opts.apiKey ?? globalOpts.apiKey,
         baseUrl: opts.baseUrl ?? globalOpts.baseUrl,
+        context: globalOpts.context ?? opts.context,
       };
       const { exitCode } = await runSetupOpenCodeCommand(merged);
       if (exitCode !== 0) process.exit(exitCode);

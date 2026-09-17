@@ -1,13 +1,13 @@
 ---
 title: "Reasoning Replay Cache"
-version: 3.8.2
-lastUpdated: 2026-05-13
+version: 3.8.40
+lastUpdated: 2026-06-28
 ---
 
 # Reasoning Replay Cache
 
 > **Source of truth:** `src/lib/db/reasoningCache.ts`, `open-sse/services/reasoningCache.ts`
-> **Last updated:** 2026-05-13 — v3.8.0
+> **Last updated:** 2026-06-28 — v3.8.40
 
 OmniRoute captures assistant `reasoning_content` produced by thinking-mode models and replays it transparently on multi-turn requests when the upstream provider requires it. This eliminates the HTTP 400 errors that strict providers raise when a client's conversation history is missing the prior turn's reasoning.
 
@@ -26,7 +26,8 @@ But typical clients (Cursor, Cline, Roo Code, OpenAI SDK) strip `reasoning_conte
 ```
 Turn N (assistant generates):
   → response contains reasoning_content + tool_calls
-  → cacheReasoningFromAssistantMessage() writes (memory + DB), keyed by every tool_call.id
+  → if requiresReasoningReplay(provider, model): cacheReasoningFromAssistantMessage()
+      writes (memory + DB), keyed by every tool_call.id
   → forward response to client (which may or may not retain reasoning)
 
 Turn N+1 (client sends follow-up):
@@ -89,6 +90,8 @@ Replay is enabled when `requiresReasoningReplay(provider, model)` returns `true`
 - `sambanova`
 - `fireworks`
 - `together`
+- `kimi-coding`
+- `kimi-coding-apikey`
 - `xiaomi-mimo`
 
 **Model regex patterns (case-insensitive):**
@@ -96,7 +99,9 @@ Replay is enabled when `requiresReasoningReplay(provider, model)` returns `true`
 - `/deepseek-r1/i`
 - `/deepseek-reasoner/i`
 - `/deepseek-chat/i`
-- `/kimi-k2/i`
+- `/deepseek[-/]?v4[-.]flash/i` and `/deepseek[-/]?v4[-.]pro/i` (V4 Flash / Pro, optional `-free` suffix)
+- `/(deepseek|zen\/deepseek)-v4/i`
+- `/kimi[-/]k\d/i`
 - `/qwq/i`
 - `/qwen.*think/i`
 - `/glm.*think/i`
@@ -153,6 +158,7 @@ The cache exposes two endpoints under `src/app/api/cache/reasoning/route.ts`. Bo
 - **Cleanup:** `cleanupReasoningCache()` purges expired memory entries and runs `DELETE FROM reasoning_cache WHERE expires_at <= unixepoch('now')`. Health-check workers call this periodically.
 - **Crash recovery:** After a restart, memory is empty but the DB still holds unexpired entries. The first lookup for a given `tool_call_id` is a DB hit; subsequent lookups are memory hits.
 - **No reasoning, no cache:** `cacheReasoningFromAssistantMessage` returns `0` when the assistant message has no `reasoning_content` / `reasoning` field, so non-thinking responses cost nothing.
+- **Write is gated too:** both call sites in `chatCore.ts` (non-streaming and streaming) only call `cacheReasoningFromAssistantMessage()` when `requiresReasoningReplay(provider, model)` is `true` — the same predicate the read side checks. Installs that never touch a replay provider stop paying for the write, the index update, and the try/catch on every reasoning-bearing response.
 - **Non-strict providers:** When `requiresReasoningReplay` is `false` and the target format is OpenAI, the translator **strips** any `reasoning_content` field from outgoing messages — OpenAI Chat Completions does not accept it.
 
 ## See Also

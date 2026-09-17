@@ -2,12 +2,17 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { NodeTypes } from "@xyflow/react";
+import { useTranslations } from "next-intl";
 import { FlowCanvas } from "@/shared/components/flow/FlowCanvas";
 import {
   comboRunToFlow,
   reduceComboEvent,
+  enrichRunWithBreakers,
+  enrichRunWithConnectionCooldown,
   type ComboRunModel,
   type ComboEventInput,
+  type ProviderBreakerSnapshot,
+  type ConnectionCooldownSnapshot,
 } from "./comboFlowModel";
 import { aggregateComboEventsToSets } from "./fleetAggregation";
 import { StrategyNode } from "./nodes/StrategyNode";
@@ -39,6 +44,7 @@ interface FleetOverviewProps {
 }
 
 function FleetOverview({ comboEvents }: FleetOverviewProps) {
+  const t = useTranslations("combos");
   // `now` must advance, or the 60s rolling window freezes at mount and aging
   // events are never re-classified out of "active". A low-frequency tick rolls it.
   const [now, setNow] = useState(() => Date.now());
@@ -57,8 +63,8 @@ function FleetOverview({ comboEvents }: FleetOverviewProps) {
     return (
       <div className="flex flex-col items-center justify-center h-full gap-2 text-muted">
         <span className="text-2xl opacity-40">⌁</span>
-        <p className="text-sm">No providers observed yet.</p>
-        <p className="text-xs opacity-60">Fleet data arrives via live combo events.</p>
+        <p className="text-sm">{t("liveNoProviders")}</p>
+        <p className="text-xs opacity-60">{t("liveFleetDataHint")}</p>
       </div>
     );
   }
@@ -68,7 +74,7 @@ function FleetOverview({ comboEvents }: FleetOverviewProps) {
       {sets.active.size > 0 && (
         <div>
           <div className="text-[10px] font-semibold uppercase tracking-wide text-muted mb-1.5">
-            Active ({sets.active.size})
+            {t("liveActiveCount", { count: sets.active.size })}
           </div>
           <div className="flex flex-wrap gap-1.5">
             {[...sets.active].map((p) => (
@@ -86,7 +92,7 @@ function FleetOverview({ comboEvents }: FleetOverviewProps) {
       {sets.error.size > 0 && (
         <div>
           <div className="text-[10px] font-semibold uppercase tracking-wide text-muted mb-1.5">
-            Errors ({sets.error.size})
+            {t("liveErrorCount", { count: sets.error.size })}
           </div>
           <div className="flex flex-wrap gap-1.5">
             {[...sets.error].map((p) => (
@@ -104,7 +110,7 @@ function FleetOverview({ comboEvents }: FleetOverviewProps) {
       {sets.last.size > 0 && (
         <div>
           <div className="text-[10px] font-semibold uppercase tracking-wide text-muted mb-1.5">
-            Inactive ({sets.last.size})
+            {t("liveInactiveCount", { count: sets.last.size })}
           </div>
           <div className="flex flex-wrap gap-1.5">
             {[...sets.last].map((p) => (
@@ -129,14 +135,15 @@ function FleetOverview({ comboEvents }: FleetOverviewProps) {
 // ── Empty state ───────────────────────────────────────────────────────────
 
 function EmptyState() {
+  const t = useTranslations("combos");
   return (
     <div
       className="flex flex-col items-center justify-center h-full gap-3 text-muted"
       data-testid="combo-live-studio-empty"
     >
       <span className="text-3xl opacity-40">⌁</span>
-      <p className="text-sm">No combo run available.</p>
-      <p className="text-xs opacity-60">Live data arrives via the WS combo channel.</p>
+      <p className="text-sm">{t("liveNoRun")}</p>
+      <p className="text-xs opacity-60">{t("liveDataHint")}</p>
     </div>
   );
 }
@@ -144,13 +151,14 @@ function EmptyState() {
 // ── Disconnected banner ───────────────────────────────────────────────────
 
 function DisconnectedBanner() {
+  const t = useTranslations("combos");
   return (
     <div
       className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-border bg-bg/80 text-xs text-muted shrink-0"
       data-testid="combo-disconnected-banner"
     >
       <span className="text-amber-500 font-semibold">●</span>
-      <span>Live disabled — WebSocket disconnected. Showing last known state.</span>
+      <span>{t("liveDisconnected")}</span>
     </div>
   );
 }
@@ -179,6 +187,20 @@ export interface ComboLiveStudioProps {
    * When false, shows the "Live disabled" banner.
    */
   isConnected?: boolean;
+  /**
+   * Per-provider circuit-breaker snapshot (`providerHealth` from
+   * GET /api/monitoring/health). When supplied, the cascade overlays the REAL
+   * breaker state (CB: OPEN · 41s) onto each target — U1b enrichment. Optional;
+   * absent → no breaker badges (graceful).
+   */
+  providerHealth?: Record<string, ProviderBreakerSnapshot> | null;
+  /**
+   * Per-provider connection-cooldown snapshot (`connectionHealth` from
+   * GET /api/monitoring/health). When supplied, the cascade overlays the REAL
+   * cooldown state (cooldown 2/3 · 28s) onto each target — U1b Slice 2. Optional;
+   * absent → no cooldown badges (graceful).
+   */
+  connectionHealth?: Record<string, ConnectionCooldownSnapshot> | null;
 }
 
 // ── Main component ────────────────────────────────────────────────────────
@@ -203,7 +225,10 @@ export function ComboLiveStudio({
   comboEvents = [],
   combos: combosProp,
   isConnected = true,
+  providerHealth,
+  connectionHealth,
 }: ComboLiveStudioProps) {
+  const t = useTranslations("combos");
   const [mode, setMode] = useState<"single" | "fleet">("single");
   const [selectedCombo, setSelectedCombo] = useState<string>("");
 
@@ -215,23 +240,33 @@ export function ComboLiveStudio({
     return [...seen];
   }, [combosProp, comboEvents]);
 
-  // Build the displayed run: static prop wins; otherwise fold live events
+  // Build the displayed run: static prop wins; otherwise fold live events.
+  // Finally overlay real circuit-breaker state (U1b) — a no-op when no health.
   const displayRun = useMemo<ComboRunModel | null>(() => {
-    if (runProp !== undefined) return runProp ?? null;
-
-    if (!selectedCombo) return null;
-
-    const eventsForCombo = comboEvents
-      .filter((e) => e.comboName === selectedCombo)
-      .sort((a, b) => a.timestamp - b.timestamp);
-
-    if (eventsForCombo.length === 0) return null;
-
-    return eventsForCombo.reduce<ComboRunModel | null>(
-      (acc, ev) => reduceComboEvent(acc, ev),
-      null
+    let baseRun: ComboRunModel | null;
+    if (runProp !== undefined) {
+      baseRun = runProp ?? null;
+    } else if (!selectedCombo) {
+      baseRun = null;
+    } else {
+      const eventsForCombo = comboEvents
+        .filter((e) => e.comboName === selectedCombo)
+        .sort((a, b) => a.timestamp - b.timestamp);
+      baseRun =
+        eventsForCombo.length === 0
+          ? null
+          : eventsForCombo.reduce<ComboRunModel | null>(
+              (acc, ev) => reduceComboEvent(acc, ev),
+              null
+            );
+    }
+    // Compose overlays: breaker state first, then connection cooldown. Both are
+    // pure no-ops when their health map is absent, and they touch disjoint fields.
+    return enrichRunWithConnectionCooldown(
+      enrichRunWithBreakers(baseRun, providerHealth),
+      connectionHealth
     );
-  }, [runProp, selectedCombo, comboEvents]);
+  }, [runProp, selectedCombo, comboEvents, providerHealth, connectionHealth]);
 
   // Build ReactFlow graph from the current run
   const { nodes, edges } = useMemo(() => {
@@ -255,10 +290,10 @@ export function ComboLiveStudio({
             className="text-xs border border-border rounded px-2 py-1 bg-bg text-muted"
             value={selectedCombo}
             onChange={(e) => setSelectedCombo(e.target.value)}
-            aria-label="Select combo"
+            aria-label={t("liveSelectCombo")}
             data-testid="combo-selector"
           >
-            <option value="">— select combo —</option>
+            <option value="">{t("liveSelectComboPlaceholder")}</option>
             {comboOptions.map((name) => (
               <option key={name} value={name}>
                 {name}
@@ -279,7 +314,7 @@ export function ComboLiveStudio({
               </span>
             )}
             <span className="text-xs text-muted">
-              {displayRun.targets.length} target{displayRun.targets.length !== 1 ? "s" : ""}
+              {t("liveTargetCount", { count: displayRun.targets.length })}
             </span>
             <span
               className="text-xs font-bold"
@@ -309,7 +344,7 @@ export function ComboLiveStudio({
             onClick={() => setMode("single")}
             data-testid="mode-single"
           >
-            Single
+            {t("liveSingle")}
           </button>
           <button
             className="px-2.5 py-1 transition-colors"
@@ -320,7 +355,7 @@ export function ComboLiveStudio({
             onClick={() => setMode("fleet")}
             data-testid="mode-fleet"
           >
-            Fleet
+            {t("liveFleet")}
           </button>
         </div>
       </div>

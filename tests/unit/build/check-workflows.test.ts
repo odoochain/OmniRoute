@@ -17,13 +17,27 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-// @ts-expect-error — .mjs helper has no type declarations; runtime shape is known.
 import {
   parseActionlintOutput,
   parseZizmorOutput,
   collectWorkflowFiles,
   isBinaryAvailable,
+  evaluateZizmorRatchet,
+  readBaselineZizmorValue,
+  // @ts-expect-error — .mjs helper has no type declarations; runtime shape is known.
 } from "../../../scripts/check/check-workflows.mjs";
+
+type RatchetVerdict = { regressed: boolean; improved: boolean };
+const evaluateZizmor = evaluateZizmorRatchet as (
+  current: number,
+  baseline: number
+) => RatchetVerdict;
+const readZizmorBaseline = readBaselineZizmorValue as (p?: string) => number | null;
+const qualityWorkflowPath = new URL("../../../.github/workflows/quality.yml", import.meta.url);
+
+function readQualityWorkflow(): string {
+  return fs.readFileSync(qualityWorkflowPath, "utf8");
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // parseActionlintOutput
@@ -52,7 +66,7 @@ test("parseActionlintOutput: one finding line returns count=1", () => {
 
 test("parseActionlintOutput: multiple finding lines returns correct count", () => {
   const stdout = [
-    ".github/workflows/ci.yml:5:1: \"on\" is the key of workflow trigger. Use quoted \"on\" [syntax-check]",
+    '.github/workflows/ci.yml:5:1: "on" is the key of workflow trigger. Use quoted "on" [syntax-check]',
     ".github/workflows/ci.yml:42:9: event name 'pull_request' is not available for 'workflow_dispatch' [events]",
     ".github/workflows/deploy.yml:8:5: unknown key 'runs-ons' in step config [syntax-check]",
   ].join("\n");
@@ -91,7 +105,11 @@ test("parseZizmorOutput: JSON with empty diagnostics array returns count=0", () 
 
 test("parseZizmorOutput: JSON { diagnostics: [...] } counts correctly", () => {
   const diagnostics = [
-    { id: "unpinned-uses", severity: "medium", message: "uses: actions/checkout@v4 is not pinned to a SHA" },
+    {
+      id: "unpinned-uses",
+      severity: "medium",
+      message: "uses: actions/checkout@v4 is not pinned to a SHA",
+    },
     { id: "script-injection", severity: "high", message: "Untrusted input in run step" },
   ];
   const result = parseZizmorOutput(JSON.stringify({ diagnostics }));
@@ -161,7 +179,7 @@ test("collectWorkflowFiles: returns .yml files from directory", () => {
     assert.ok(files.some((f) => f.endsWith("deploy.yml")));
     assert.ok(!files.some((f) => f.endsWith("README.md")));
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -176,7 +194,7 @@ test("collectWorkflowFiles: also collects .yaml extension", () => {
     assert.ok(files.some((f) => f.endsWith(".yaml")));
     assert.ok(files.some((f) => f.endsWith(".yml")));
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -188,7 +206,7 @@ test("collectWorkflowFiles: returns absolute paths", () => {
     assert.equal(files.length, 1);
     assert.ok(path.isAbsolute(files[0]));
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -198,7 +216,7 @@ test("collectWorkflowFiles: empty directory returns empty array", () => {
     const files = collectWorkflowFiles(dir);
     assert.deepEqual(files, []);
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -222,4 +240,134 @@ test("isBinaryAvailable: returns boolean (not null/undefined)", () => {
 test("isBinaryAvailable: node is available (sanity check for test environment)", () => {
   // node must be in PATH for this test suite to even run.
   assert.equal(isBinaryAvailable("node"), true);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// evaluateZizmorRatchet — ratchet direction:down, zizmorFindings ONLY (Etapa 2)
+// Regression when measured > baseline. actionlint is reported, not ratcheted.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test("evaluateZizmorRatchet: measured == baseline passes (192 vs 192)", () => {
+  const r = evaluateZizmor(192, 192);
+  assert.equal(r.regressed, false);
+  assert.equal(r.improved, false);
+});
+
+test("evaluateZizmorRatchet: one more than baseline is a regression (193 vs 192)", () => {
+  const r = evaluateZizmor(193, 192);
+  assert.equal(r.regressed, true, "a single new zizmor finding must block");
+  assert.equal(r.improved, false);
+});
+
+test("evaluateZizmorRatchet: fewer than baseline is an improvement (190 vs 192)", () => {
+  const r = evaluateZizmor(190, 192);
+  assert.equal(r.regressed, false);
+  assert.equal(r.improved, true);
+});
+
+test("evaluateZizmorRatchet: strict integer comparison — any increase regresses", () => {
+  assert.equal(evaluateZizmor(193, 192).regressed, true);
+  assert.equal(evaluateZizmor(192, 192).regressed, false);
+  assert.equal(evaluateZizmor(191, 192).regressed, false);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// readBaselineZizmorValue — tolerant read of quality-baseline.json
+// ─────────────────────────────────────────────────────────────────────────────
+
+function withTmpBaseline(content: string | null, fn: (p: string) => void) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "workflows-baseline-"));
+  const p = path.join(dir, "quality-baseline.json");
+  if (content !== null) fs.writeFileSync(p, content);
+  try {
+    fn(p);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+}
+
+test("readBaselineZizmorValue: reads metrics.zizmorFindings.value", () => {
+  withTmpBaseline(JSON.stringify({ metrics: { zizmorFindings: { value: 192 } } }), (p) => {
+    assert.equal(readZizmorBaseline(p), 192);
+  });
+});
+
+test("readBaselineZizmorValue: missing file returns null (graceful SKIP)", () => {
+  assert.equal(readZizmorBaseline("/tmp/does-not-exist-88888/quality-baseline.json"), null);
+});
+
+test("readBaselineZizmorValue: missing metric returns null", () => {
+  withTmpBaseline(JSON.stringify({ metrics: {} }), (p) => {
+    assert.equal(readZizmorBaseline(p), null);
+  });
+});
+
+test("readBaselineZizmorValue: non-numeric value returns null", () => {
+  withTmpBaseline(JSON.stringify({ metrics: { zizmorFindings: { value: "192" } } }), (p) => {
+    assert.equal(readZizmorBaseline(p), null);
+  });
+});
+
+test("readBaselineZizmorValue: invalid JSON returns null (does not throw)", () => {
+  withTmpBaseline("{ broken", (p) => {
+    assert.equal(readZizmorBaseline(p), null);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// quality.yml — release PR build gate regression coverage (#7307)
+// ─────────────────────────────────────────────────────────────────────────────
+
+test("#7307 quality.yml adds an advisory production build for release PR code changes", () => {
+  const source = readQualityWorkflow();
+  const buildJob = source.match(/\n  build:\n[\s\S]*?\n  # Docs\/OpenAPI contract gates only/);
+
+  assert.match(source, /pull_request:\n\s+branches: \["release\/\*\*"\]/);
+  assert.ok(buildJob, "quality.yml must define the build job before docs-gates");
+  assert.match(buildJob[0], /name: Build \(advisory\)/);
+  assert.match(buildJob[0], /needs: changes/);
+  assert.match(buildJob[0], /needs\.changes\.outputs\.code == 'true'/);
+  assert.match(buildJob[0], /github\.event\.pull_request\.draft == false/);
+  assert.match(buildJob[0], /startsWith\(github\.head_ref, 'mergify\/merge-queue\/'\)/);
+  // FORK PRs ONLY (2026-08-14). build.yml's `Fast Production Build` fires on
+  // `push: branches: ["**"]` and runs the superset `build:release`, so own-origin branches
+  // were building twice; a fork's push never reaches this repo, making this their only
+  // pre-merge build signal — and forks are 72 of the last 100 PRs into release/**.
+  assert.match(
+    buildJob[0],
+    /github\.event\.pull_request\.head\.repo\.full_name != github\.repository/
+  );
+  // Runner PINNED to hosted. The self-hosted pool is 2 permanently-busy runners, where this
+  // job either queued for hours or was killed by cancel-in-progress — ~10-15% of runs ever
+  // reached a conclusion across 2026-08-13/14. It must NOT go back on the USE_VPS_RUNNER
+  // switch (other workflows keep that variable).
+  assert.match(buildJob[0], /\n {4}runs-on: ubuntu-latest\n/);
+  // Check the DIRECTIVES, not the prose: the comment above legitimately explains why the
+  // self-hosted pool was abandoned, so a naive /self-hosted/ scan over the whole block would
+  // match its own rationale.
+  const buildDirectives = buildJob[0]
+    .split("\n")
+    .filter((line) => !/^\s*#/.test(line))
+    .join("\n");
+  assert.doesNotMatch(buildDirectives, /self-hosted/);
+  assert.doesNotMatch(buildDirectives, /USE_VPS_RUNNER/);
+  // Memory provisioning mirrored from build.yml: --max-old-space-size bounds only V8's heap,
+  // never Turbopack's native Rust allocation (#6409), so the swapfile is the load-bearing
+  // half. Dropping either one puts the hosted build back at risk of an OOM.
+  assert.match(buildJob[0], /fallocate -l 10G \/mnt\/swapfile/);
+  assert.match(buildJob[0], /swapon \/mnt\/swapfile/);
+  assert.match(buildJob[0], /NODE_OPTIONS: "--max-old-space-size=12288"/);
+  assert.match(buildJob[0], /OMNIROUTE_BUILD_MEMORY_MB: "12288"/);
+  assert.match(buildJob[0], /continue-on-error: true/);
+  assert.match(buildJob[0], /uses: actions\/checkout@[0-9a-f]{40} # v7/);
+  assert.match(buildJob[0], /uses: actions\/setup-node@[0-9a-f]{40} # v7/);
+  assert.match(buildJob[0], /uses: \.\/\.github\/actions\/npm-ci-retry/);
+  assert.match(buildJob[0], /npm run check:node-runtime/);
+  assert.match(buildJob[0], /npm run build/);
+  assert.match(buildJob[0], /OMNIROUTE_USE_TURBOPACK: "1"/);
+  assert.doesNotMatch(buildJob[0], /actions\/upload-artifact/);
+  assert.match(
+    buildJob[0],
+    /remove\s+# continue-on-error after the production-build signal is stable/
+  );
 });

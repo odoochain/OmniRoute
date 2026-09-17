@@ -40,7 +40,7 @@ Create or update a model alias
 
 ```bash
 curl -X POST https://localhost:20128/api/models/alias \
-  -H "Authorization: Bearer $OMNIROUTE_TOKEN"
+  -H "Authorization: Bearer $OMNIROUTE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{}'
 ```
@@ -56,4 +56,4 @@ curl https://localhost:20128/api/models/catalog \
 
 ## Payloads
 
-See the full OpenAPI specification at `GET /api/openapi/spec` or `docs/reference/openapi.yaml` for detailed request/response schemas.
+See the full OpenAPI specification at `GET /api/openapi/spec` or `docs/openapi.yaml` for detailed request/response schemas.

@@ -10,8 +10,8 @@ const { createResponsesApiTransformStream, createResponsesLogger } =
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-async function runTransformStream(chunks, logger = null) {
-  const stream = createResponsesApiTransformStream(logger);
+async function runTransformStream(chunks, logger = null, options = {}) {
+  const stream = createResponsesApiTransformStream(logger, 3000, options);
   const writer = stream.writable.getWriter();
   const reader = stream.readable.getReader();
 
@@ -76,16 +76,39 @@ test("createResponsesApiTransformStream converts plain chat deltas into Response
   assert.ok(types.includes("response.output_text.done"));
   assert.equal(completed.output[0].content[0].text, "Hello");
   assert.deepEqual(completed.usage, {
-    prompt_tokens: 1,
-    completion_tokens: 2,
+    input_tokens: 1,
+    input_tokens_details: { cached_tokens: 0 },
+    output_tokens: 2,
+    output_tokens_details: { reasoning_tokens: 0 },
     total_tokens: 3,
   });
   assert.equal(doneMarker.data, "[DONE]");
 });
 
-test("createResponsesApiTransformStream converts think tags into reasoning summaries", async () => {
+test("createResponsesApiTransformStream preserves prompt-format think tags by default", async () => {
   const output = await runTransformStream([
-    'data: {"choices":[{"index":0,"delta":{"content":"<think>plan"}}]}\n\n',
+    'data: {"id":"chatcmpl_1","model":"gpt-4.1","choices":[{"index":0,"delta":{"content":"<think>plan"}}]}\n\n',
+    'data: {"choices":[{"index":0,"delta":{"content":"ning</think>answer"}}]}\n\n',
+    'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+  ]);
+
+  const events = parseSseOutput(output);
+  const reasoningDeltas = events
+    .filter((event) => event.event === "response.reasoning_summary_text.delta")
+    .map((event) => JSON.parse(event.data).delta);
+  const completed = JSON.parse(
+    events.find((event) => event.event === "response.completed").data
+  ).response;
+
+  assert.deepEqual(reasoningDeltas, []);
+  assert.deepEqual(completed.output[0].content, [
+    { type: "output_text", annotations: [], logprobs: [], text: "<think>planning</think>answer" },
+  ]);
+});
+
+test("createResponsesApiTransformStream extracts think tags for tag-native models", async () => {
+  const output = await runTransformStream([
+    'data: {"id":"chatcmpl_1","model":"deepseek-ai/DeepSeek-R1","choices":[{"index":0,"delta":{"content":"<think>plan"}}]}\n\n',
     'data: {"choices":[{"index":0,"delta":{"content":"ning</think>answer"}}]}\n\n',
     'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
   ]);
@@ -99,13 +122,9 @@ test("createResponsesApiTransformStream converts think tags into reasoning summa
   ).response;
 
   assert.deepEqual(reasoningDeltas, ["plan", "ning"]);
-  assert.deepEqual(completed.output[0], {
-    id: completed.output[0].id,
-    type: "reasoning",
-    summary: [{ type: "summary_text", text: "planning" }],
-  });
+  assert.equal(completed.output[0].type, "reasoning");
   assert.deepEqual(completed.output[1].content, [
-    { type: "output_text", annotations: [], text: "answer" },
+    { type: "output_text", annotations: [], logprobs: [], text: "answer" },
   ]);
 });
 
@@ -158,6 +177,166 @@ test("createResponsesApiTransformStream handles native reasoning content and too
   );
 });
 
+test("createResponsesApiTransformStream converts OpenAI-compatible reasoning aliases", async () => {
+  const output = await runTransformStream([
+    'data: {"id":"chatcmpl_1","model":"gpt-oss:20b","choices":[{"index":0,"delta":{"reasoning":"plan "}}]}\n\n',
+    'data: {"choices":[{"index":0,"delta":{"reasoning":"carefully","content":"answer"}}]}\n\n',
+    'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}\n\n',
+  ]);
+
+  const events = parseSseOutput(output);
+  const reasoningDeltas = events
+    .filter((event) => event.event === "response.reasoning_summary_text.delta")
+    .map((event) => JSON.parse(event.data).delta);
+  const addedItems = events
+    .filter((event) => event.event === "response.output_item.added")
+    .map((event) => JSON.parse(event.data).item);
+  const completed = JSON.parse(
+    events.find((event) => event.event === "response.completed").data
+  ).response;
+
+  assert.deepEqual(reasoningDeltas, ["plan ", "carefully"]);
+  assert.deepEqual(
+    addedItems.map((item) => item.type),
+    ["reasoning", "message"]
+  );
+  assert.equal(completed.output[0].type, "reasoning");
+  assert.equal(completed.output[0].summary[0].text, "plan carefully");
+  assert.equal(completed.output[1].content[0].text, "answer");
+});
+
+test("createResponsesApiTransformStream prefers reasoning_content without duplicating aliases", async () => {
+  const output = await runTransformStream([
+    'data: {"choices":[{"index":0,"delta":{"reasoning_content":"canonical","reasoning":"alias"}}]}\n\n',
+    'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n',
+  ]);
+
+  const events = parseSseOutput(output);
+  const reasoningDeltas = events
+    .filter((event) => event.event === "response.reasoning_summary_text.delta")
+    .map((event) => JSON.parse(event.data).delta);
+
+  assert.deepEqual(reasoningDeltas, ["canonical"]);
+});
+
+test("createResponsesApiTransformStream hides the internal reasoning replay placeholder", async () => {
+  const output = await runTransformStream([
+    'data: {"choices":[{"index":0,"delta":{"reasoning_content":"(prior reasoning summary unavailable)"}}]}\n\n',
+    'data: {"choices":[{"index":0,"delta":{"content":"Visible answer"},"finish_reason":null}]}\n\n',
+    'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+  ]);
+
+  const events = parseSseOutput(output);
+  assert.equal(
+    events.some((event) => event.event === "response.reasoning_summary_text.delta"),
+    false
+  );
+  assert.equal(output.includes("prior reasoning summary unavailable"), false);
+  assert.equal(output.includes("Visible answer"), true);
+});
+test("createResponsesApiTransformStream restores declared custom tools without changing functions", async () => {
+  const output = await runTransformStream(
+    [
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_exec","function":{"name":"exec","arguments":"{\\"input\\":\\"text(\\\\\\"pong\\\\\\")\\"}"}}]}}]}\n\n',
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_search","function":{"name":"search","arguments":"{\\"q\\":\\"pong\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
+    ],
+    null,
+    { customToolNames: new Set(["exec"]) }
+  );
+
+  const events = parseSseOutput(output);
+  const added = events
+    .filter((event) => event.event === "response.output_item.added")
+    .map((event) => JSON.parse(event.data).item);
+  const completed = JSON.parse(
+    events.find((event) => event.event === "response.completed").data
+  ).response;
+
+  assert.equal(added.find((item) => item.name === "exec").type, "custom_tool_call");
+  assert.equal(added.find((item) => item.name === "search").type, "function_call");
+  assert.ok(events.some((event) => event.event === "response.custom_tool_call_input.delta"));
+  assert.ok(events.some((event) => event.event === "response.custom_tool_call_input.done"));
+  assert.equal(completed.output.find((item) => item.name === "exec").input, 'text("pong")');
+  assert.equal(completed.output.find((item) => item.name === "search").arguments, '{"q":"pong"}');
+});
+
+test("createResponsesApiTransformStream preserves empty custom-tool input", async () => {
+  const output = await runTransformStream(
+    [
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_empty","function":{"name":"exec","arguments":"{\\"input\\":\\"\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
+    ],
+    null,
+    { customToolNames: new Set(["exec"]) }
+  );
+  const events = parseSseOutput(output);
+  const done = events
+    .filter((event) => event.event === "response.output_item.done")
+    .map((event) => JSON.parse(event.data).item)
+    .find((item) => item.name === "exec");
+  assert.equal(done.type, "custom_tool_call");
+  assert.equal(done.input, "");
+});
+
+test("createResponsesApiTransformStream defers custom item creation until the tool name arrives", async () => {
+  const output = await runTransformStream(
+    [
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_exec"}]}}]}\n\n',
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"exec","arguments":"{\\"input\\":\\"pong\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
+    ],
+    null,
+    { customToolNames: new Set(["exec"]) }
+  );
+
+  const events = parseSseOutput(output);
+  const added = events
+    .filter((event) => event.event === "response.output_item.added")
+    .map((event) => JSON.parse(event.data).item)
+    .filter((item) => item.call_id === "call_exec");
+
+  assert.deepEqual(added, [
+    {
+      id: "fc_call_exec",
+      type: "custom_tool_call",
+      input: "",
+      call_id: "call_exec",
+      name: "exec",
+      status: "in_progress",
+    },
+  ]);
+  assert.equal(events.filter((event) => event.event === "response.output_item.done").length, 1);
+});
+
+test("createResponsesApiTransformStream replays buffered function arguments after the name arrives", async () => {
+  const output = await runTransformStream([
+    'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_search","function":{"arguments":"{\\"q\\":\\"pong\\"}"}}]}}]}\n\n',
+    'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"search"}}]},"finish_reason":"tool_calls"}]}\n\n',
+  ]);
+
+  const events = parseSseOutput(output);
+  const argumentDeltas = events
+    .filter((event) => event.event === "response.function_call_arguments.delta")
+    .map((event) => JSON.parse(event.data).delta);
+
+  assert.deepEqual(argumentDeltas, ['{"q":"pong"}']);
+});
+
+test("createResponsesApiTransformStream preserves empty custom-tool input", async () => {
+  const output = await runTransformStream(
+    [
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_exec","function":{"name":"exec","arguments":"{\\"input\\":\\"\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
+    ],
+    null,
+    { customToolNames: new Set(["exec"]) }
+  );
+
+  const events = parseSseOutput(output);
+  const completed = JSON.parse(
+    events.find((event) => event.event === "response.completed").data
+  ).response;
+
+  assert.equal(completed.output.find((item) => item.name === "exec").input, "");
+});
+
 test("createResponsesLogger persists input and output event logs on flush", async () => {
   const logsDir = mkdtempSync(join(tmpdir(), "responses-transformer-"));
   const logger = createResponsesLogger("gpt-4o", logsDir);
@@ -197,8 +376,10 @@ test("createResponsesApiTransformStream ignores malformed events and preserves u
   assert.equal(completed.id, "resp_chatcmpl_edge");
   assert.equal(completed.output[0].content[0].text, "ok");
   assert.deepEqual(completed.usage, {
-    prompt_tokens: 2,
-    completion_tokens: 1,
+    input_tokens: 2,
+    input_tokens_details: { cached_tokens: 0 },
+    output_tokens: 1,
+    output_tokens_details: { reasoning_tokens: 0 },
     total_tokens: 3,
   });
 });
@@ -223,7 +404,7 @@ test("createResponsesLogger returns null for invalid base paths and swallows flu
   logger.logOutput("output");
 
   const sessionDir = readdirSync(join(logsDir, "logs"))[0];
-  rmSync(join(logsDir, "logs", sessionDir), { recursive: true, force: true });
+  rmSync(join(logsDir, "logs", sessionDir), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   console.log = (...args) => capturedLogs.push(args.join(" "));
 
   try {
@@ -283,4 +464,81 @@ test("createResponsesApiTransformStream concatenates incremental tool argument f
     .map((event) => JSON.parse(event.data).delta)
     .join("");
   assert.equal(streamedArgs, '{"cmd":"ll -l"}');
+});
+
+test("createResponsesApiTransformStream clears the keepalive timer when the stream is cancelled (no timer leak)", async () => {
+  // Regression: the 3s keepalive interval used to be cleared ONLY in flush(), which
+  // does not run when the client disconnects mid-stream. The orphaned interval then
+  // fired (and threw on the closed controller) forever, leaking one live timer per
+  // aborted /v1/responses stream and burning CPU as they accumulated. Verify the timer
+  // is cleared when the readable side is cancelled.
+  const realSetInterval = globalThis.setInterval;
+  const realClearInterval = globalThis.clearInterval;
+  const live = new Set();
+  globalThis.setInterval = function (handler, timeout, ...args) {
+    const id = realSetInterval(handler, timeout, ...args);
+    live.add(id);
+    return id;
+  };
+  globalThis.clearInterval = function (id) {
+    live.delete(id);
+    return realClearInterval(id);
+  };
+
+  try {
+    const stream = createResponsesApiTransformStream(null, 10);
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+
+    // start() runs on construction and creates exactly one keepalive interval.
+    assert.equal(live.size, 1, "keepalive interval should be active while streaming");
+
+    await writer.write(
+      encoder.encode('data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n')
+    );
+    await reader.read();
+
+    // Simulate a client disconnect mid-stream.
+    await reader.cancel();
+
+    assert.equal(live.size, 0, "keepalive interval must be cleared when the stream is cancelled");
+  } finally {
+    globalThis.setInterval = realSetInterval;
+    globalThis.clearInterval = realClearInterval;
+  }
+});
+
+test("createResponsesApiTransformStream keepalive self-clears when enqueue fails on a torn-down controller", async () => {
+  // Backstop for transports where neither flush() nor cancel() runs: the keepalive
+  // callback must clear its own interval the first time enqueue() throws, instead of
+  // re-throwing on every tick forever.
+  const realSetInterval = globalThis.setInterval;
+  const realClearInterval = globalThis.clearInterval;
+  let capturedCallback = null;
+  let capturedId = null;
+  let cleared = false;
+  globalThis.setInterval = function (handler, timeout, ...args) {
+    capturedCallback = handler;
+    capturedId = realSetInterval(() => {}, 1 << 30, ...args); // inert real timer as the id
+    return capturedId;
+  };
+  globalThis.clearInterval = function (id) {
+    if (id === capturedId) cleared = true;
+    return realClearInterval(id);
+  };
+
+  try {
+    const stream = createResponsesApiTransformStream(null, 10);
+    // Error the readable side so the controller can no longer accept enqueues.
+    await stream.readable.cancel();
+
+    assert.equal(typeof capturedCallback, "function", "keepalive callback should be captured");
+    // Manually invoke the keepalive tick: enqueue() will throw on the torn-down
+    // controller, and the callback must clear its own interval rather than rethrow.
+    assert.doesNotThrow(() => capturedCallback());
+    assert.equal(cleared, true, "keepalive interval should self-clear after a failed enqueue");
+  } finally {
+    globalThis.setInterval = realSetInterval;
+    globalThis.clearInterval = realClearInterval;
+  }
 });

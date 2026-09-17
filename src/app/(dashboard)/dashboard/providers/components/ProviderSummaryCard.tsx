@@ -33,13 +33,18 @@ export interface ProviderSummaryStats {
 
 interface ProviderSummaryCardProps {
   activeCategory: string | null;
+  activeServiceKind: string | null;
+  onServiceKindChange(kind: string | null): void;
   disabledConfigured: boolean;
   displayMode: ProviderDisplayMode;
+  modelSearchQuery: string;
   onBatchTest(mode: string): void;
   onCategoryChange(category: string | null, freeOnly: boolean): void;
   onDisplayModeChange(mode: ProviderDisplayMode): void;
   onNewProvider(): void;
+  onImportFromFile(): void;
   searchQuery: string;
+  setModelSearchQuery(value: string): void;
   setSearchQuery(value: string): void;
   showFreeOnly: boolean;
   summaryStats: ProviderSummaryStats;
@@ -66,15 +71,35 @@ function providerText(
   return fallback;
 }
 
+const SERVICE_KIND_CHIPS: Array<{ key: string; icon: string; labelKey: string; fallback: string }> =
+  [
+    { key: "image", icon: "image", labelKey: "serviceKindImage", fallback: "Image" },
+    { key: "video", icon: "videocam", labelKey: "serviceKindVideo", fallback: "Video" },
+    { key: "music", icon: "music_note", labelKey: "serviceKindMusic", fallback: "Music" },
+    { key: "tts", icon: "record_voice_over", labelKey: "serviceKindTts", fallback: "Text→Speech" },
+    { key: "stt", icon: "hearing", labelKey: "serviceKindStt", fallback: "Speech→Text" },
+    {
+      key: "embedding",
+      icon: "scatter_plot",
+      labelKey: "serviceKindEmbedding",
+      fallback: "Embedding",
+    },
+  ];
+
 export default function ProviderSummaryCard({
   activeCategory,
+  activeServiceKind,
+  onServiceKindChange,
   disabledConfigured,
   displayMode,
+  modelSearchQuery,
   onBatchTest,
   onCategoryChange,
   onDisplayModeChange,
   onNewProvider,
+  onImportFromFile,
   searchQuery,
+  setModelSearchQuery,
   setSearchQuery,
   showFreeOnly,
   summaryStats,
@@ -85,7 +110,12 @@ export default function ProviderSummaryCard({
   const categories = [
     { key: null, color: null, label: t("providerSummaryAll"), stat: summaryStats.all },
     { key: "oauth", color: "bg-blue-500", label: t("oauthLabel"), stat: summaryStats.oauth },
-    { key: "ide", color: "bg-cyan-500", label: "IDE", stat: summaryStats.ide },
+    {
+      key: "ide",
+      color: "bg-cyan-500",
+      label: providerText(t, "categoryIde", "IDE"),
+      stat: summaryStats.ide,
+    },
     {
       key: "free",
       color: "bg-green-500",
@@ -107,8 +137,18 @@ export default function ProviderSummaryCard({
       label: t("compatibleLabel"),
       stat: summaryStats.compatible,
     },
-    { key: "webcookie", color: "bg-purple-500", label: "Web Cookie", stat: summaryStats.webcookie },
-    { key: "search", color: "bg-teal-500", label: "Search", stat: summaryStats.search },
+    {
+      key: "webcookie",
+      color: "bg-purple-500",
+      label: providerText(t, "categoryWebCookie", "Web Cookie"),
+      stat: summaryStats.webcookie,
+    },
+    {
+      key: "search",
+      color: "bg-teal-500",
+      label: providerText(t, "categorySearch", "Search"),
+      stat: summaryStats.search,
+    },
     {
       key: "webfetch",
       color: "bg-orange-500",
@@ -116,15 +156,25 @@ export default function ProviderSummaryCard({
       stat: summaryStats.webfetch,
       title: t("webFetchTooltip"),
     },
-    { key: "audio", color: "bg-rose-500", label: "Audio", stat: summaryStats.audio },
-    { key: "local", color: "bg-emerald-500", label: "Local", stat: summaryStats.local },
+    {
+      key: "audio",
+      color: "bg-rose-500",
+      label: providerText(t, "categoryAudio", "Audio"),
+      stat: summaryStats.audio,
+    },
+    {
+      key: "local",
+      color: "bg-emerald-500",
+      label: providerText(t, "categoryLocal", "Local"),
+      stat: summaryStats.local,
+    },
     {
       key: "cloudagent",
       color: "bg-violet-500",
-      label: "Cloud Agent",
+      label: providerText(t, "categoryCloudAgent", "Cloud Agent"),
       stat: summaryStats.cloudagent,
     },
-  ];
+  ].filter((category) => category.key !== "no-auth" || category.stat.total > 0);
 
   return (
     <Card padding="sm">
@@ -149,6 +199,25 @@ export default function ProviderSummaryCard({
               </button>
             )}
           </div>
+          <div className="relative flex-1 min-w-[160px]">
+            <Input
+              value={modelSearchQuery}
+              onChange={(e) => setModelSearchQuery(e.target.value)}
+              placeholder={providerText(t, "searchByModel", "Search by model…")}
+              aria-label={providerText(t, "searchByModelAria", "Search by model")}
+              icon="psychology"
+              inputClassName={modelSearchQuery ? "pr-9" : ""}
+            />
+            {modelSearchQuery && (
+              <button
+                onClick={() => setModelSearchQuery("")}
+                className="absolute inset-y-0 right-0 flex items-center pr-2.5 text-text-muted hover:text-text-primary transition-colors"
+                aria-label={tc("clear")}
+              >
+                <span className="material-symbols-outlined text-[18px]">close</span>
+              </button>
+            )}
+          </div>
           <ProviderDisplayModeControl
             disabledConfigured={disabledConfigured}
             mode={displayMode}
@@ -157,6 +226,9 @@ export default function ProviderSummaryCard({
           />
           <Button size="sm" icon="add" onClick={onNewProvider}>
             {providerText(t, "onboardingWizardShort", "Onboarding Wizard")}
+          </Button>
+          <Button size="sm" variant="secondary" icon="upload_file" onClick={onImportFromFile}>
+            {providerText(t, "importFromFile", "Import from file")}
           </Button>
           <button
             onClick={() => onBatchTest("all")}
@@ -204,6 +276,38 @@ export default function ProviderSummaryCard({
               </button>
             );
           })}
+        </div>
+
+        <div className="border-t border-border pt-3 flex flex-wrap items-center gap-2">
+          <span className="text-[11px] font-medium uppercase tracking-wide text-text-muted mr-1">
+            {providerText(t, "filterByMedia", "Media")}
+          </span>
+          {SERVICE_KIND_CHIPS.map((chip) => {
+            const isActive = activeServiceKind === chip.key;
+            return (
+              <button
+                key={chip.key}
+                onClick={() => onServiceKindChange(isActive ? null : chip.key)}
+                aria-pressed={isActive}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-medium transition-colors ${
+                  isActive
+                    ? "bg-primary text-white border-primary"
+                    : "bg-bg-subtle border-border text-text-muted hover:text-text-primary hover:border-primary/30"
+                }`}
+              >
+                <span className="material-symbols-outlined text-[14px]">{chip.icon}</span>
+                <span>{providerText(t, chip.labelKey, chip.fallback)}</span>
+              </button>
+            );
+          })}
+          {activeServiceKind && (
+            <button
+              onClick={() => onServiceKindChange(null)}
+              className="text-[11px] text-text-muted hover:text-text-primary underline-offset-2 hover:underline"
+            >
+              {providerText(t, "clearMediaFilter", "Clear")}
+            </button>
+          )}
         </div>
       </div>
     </Card>

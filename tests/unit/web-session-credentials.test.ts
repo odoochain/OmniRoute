@@ -15,14 +15,19 @@ test("web session credential metadata covers every web-cookie provider", () => {
 });
 
 test("web session credential metadata identifies cookie, token, and no-auth providers", () => {
-  // Grok needs BOTH sso and sso-rw cookies (#3180)
-  assert.deepEqual(webSessionCredentials.getWebSessionCredentialRequirement("grok-web"), {
-    kind: "cookie",
-    credentialName: "sso + sso-rw",
-    placeholder: "sso=...; sso-rw=...",
-    acceptsFullCookieHeader: true,
-    storageKeys: ["cookie", "sso", "sso-rw"],
-  });
+  // Grok needs BOTH sso and sso-rw cookies (#3180). #7567 added the proactive
+  // cf_clearance/User-Agent hint — assert its intent, don't freeze operator copy.
+  {
+    const req = webSessionCredentials.getWebSessionCredentialRequirement("grok-web");
+    assert.ok(req && req.kind === "cookie");
+    assert.equal(req.credentialName, "sso + sso-rw");
+    assert.equal(req.placeholder, "sso=...; sso-rw=...");
+    assert.equal(req.acceptsFullCookieHeader, true);
+    assert.deepEqual(req.storageKeys, ["cookie", "sso", "sso-rw"]);
+    assert.equal(req.hintKey, "grokWebCookieHint");
+    assert.ok(typeof req.hintFallback === "string" && /cf_clearance/.test(req.hintFallback));
+    assert.ok(/User-Agent/.test(req.hintFallback));
+  }
   assert.deepEqual(webSessionCredentials.getWebSessionCredentialRequirement("copilot-web"), {
     kind: "token",
     credentialName: "access_token",
@@ -37,13 +42,46 @@ test("web session credential metadata identifies cookie, token, and no-auth prov
     acceptsFullCookieHeader: false,
     storageKeys: ["token", "userToken"],
   });
-  // lmarena.ai's real auth cookie is `arena-auth-prod-v1`, not `session` (#3810)
-  assert.deepEqual(webSessionCredentials.getWebSessionCredentialRequirement("lmarena"), {
+  {
+    const req = webSessionCredentials.getWebSessionCredentialRequirement("zai-web");
+    assert.ok(req && req.kind === "token");
+    assert.equal(req.credentialName, 'Local Storage value named "token"');
+    assert.equal(req.acceptsFullCookieHeader, false);
+    assert.deepEqual(req.storageKeys, ["token"]);
+    assert.equal(req.hintKey, "zaiWebCredentialHint");
+    assert.ok(req.hintFallback?.includes("Do not copy a Cookie header"));
+    assert.equal(req.guideSteps?.length, 4);
+    assert.ok(req.guideSteps?.some((step) => step.includes("Local Storage")));
+    assert.ok(req.guideSteps?.some((step) => step.includes("browser transport")));
+  }
+  // Arena (lmarena): assert contract/intent only — do not freeze UX copy.
+  // #3810 chunk name, #4271 split SSR cookies, full Cookie header paste.
+  {
+    const req = webSessionCredentials.getWebSessionCredentialRequirement("lmarena");
+    assert.ok(req && req.kind === "cookie");
+    assert.equal(req.acceptsFullCookieHeader, true);
+    assert.equal(req.hintKey, "lmarenaWebCookieHint");
+    assert.ok(req.storageKeys.includes("cookie"));
+    assert.ok(req.storageKeys.includes("arena-auth-prod-v1.0"));
+    assert.ok(req.storageKeys.includes("arena-auth-prod-v1.1"));
+    // legacy key retained for already-saved credentials
+    assert.ok(req.storageKeys.includes("session"));
+    assert.ok(/full cookie header/i.test(req.credentialName));
+    assert.ok(/arena-auth-prod-v1/i.test(req.placeholder));
+    // hintFallback is operator copy — may change with CF/reCAPTCHA notes; must still
+    // steer users to a full header and away from the empty single base cookie.
+    assert.ok(typeof req.hintFallback === "string" && req.hintFallback.length > 0);
+    assert.ok(/full cookie header/i.test(req.hintFallback));
+    assert.ok(/arena-auth-prod-v1/i.test(req.hintFallback));
+    assert.ok(/empty/i.test(req.hintFallback));
+  }
+  assert.deepEqual(webSessionCredentials.getWebSessionCredentialRequirement("huggingchat"), {
     kind: "cookie",
-    credentialName: "arena-auth-prod-v1",
-    placeholder: "arena-auth-prod-v1=... or full Cookie header from lmarena.ai",
+    credentialName: "full Cookie header (hf-chat + token)",
+    placeholder:
+      "hf-chat=...; token=...; aws-waf-token=... (full Cookie header from huggingface.co)",
     acceptsFullCookieHeader: true,
-    storageKeys: ["cookie", "arena-auth-prod-v1", "session"],
+    storageKeys: ["cookie", "hf-chat"],
   });
   // veoaifree-web is now a NOAUTH provider — not in WEB_SESSION_CREDENTIAL_REQUIREMENTS
   assert.equal(webSessionCredentials.getWebSessionCredentialRequirement("veoaifree-web"), null);
@@ -53,6 +91,16 @@ test("web session credential metadata identifies cookie, token, and no-auth prov
     placeholder: "convex-session-id=abc123...; Cookie: ...",
     acceptsFullCookieHeader: true,
     storageKeys: ["cookie", "convex-session-id", "convexSessionId"],
+    // #5465 — t3.chat ships a step-by-step DevTools copy hint (localStorage + Cookie header).
+    hintKey: "t3ChatWebCookieHint",
+  });
+  assert.deepEqual(webSessionCredentials.getWebSessionCredentialRequirement("conol-web"), {
+    kind: "cookie",
+    credentialName: "__Secure-better-auth.session_token",
+    placeholder: "__Secure-better-auth.session_token=... or full Cookie header from conol.ai",
+    acceptsFullCookieHeader: true,
+    // #8974 defines storageKeys on the conol-web entry (src/shared/providers/webSessionCredentials.ts)
+    storageKeys: ["cookie", "__Secure-better-auth.session_token"],
   });
 });
 

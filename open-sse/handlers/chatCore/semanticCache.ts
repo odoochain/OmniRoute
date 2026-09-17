@@ -6,7 +6,7 @@ import {
 import { calculateCost } from "@/lib/usage/costCalculator";
 import { trackPendingRequest } from "@/lib/usageDb";
 import { synthesizeOpenAiSseFromJson } from "../../utils/jsonToSse.ts";
-import { buildOmniRouteResponseMetaHeaders } from "@/domain/omnirouteResponseMeta";
+import { attachOmniRouteMetaHeaders } from "@/domain/omnirouteResponseMeta";
 import { extractUsageFromResponse } from "../usageExtractor.ts";
 import { OMNIROUTE_RESPONSE_HEADERS } from "@/shared/constants/headers";
 
@@ -24,21 +24,27 @@ export async function checkSemanticCache({
   log,
   persistAttemptLogs,
   apiKeyId,
+  cacheDefaultMode,
 }: {
   semanticCacheEnabled: boolean;
-  body: Record<string, unknown>;
-  clientRawRequest: unknown;
+  // Only the fields this read path actually touches are named; everything else
+  // on the request body stays `unknown` via the index signature.
+  body: Record<string, unknown> & { temperature?: number; top_p?: number };
+  clientRawRequest: { headers?: unknown } | null;
   model: string;
   provider: string;
   stream: boolean;
-  reqLogger: unknown;
-  effectiveServiceTier: unknown;
+  reqLogger: { logConvertedResponse: (response: Record<string, unknown>) => void };
+  effectiveServiceTier: string | null | undefined;
   connectionId: string | null;
   startTime: number;
-  log: unknown;
+  log: { debug?: (...args: unknown[]) => void } | null;
   persistAttemptLogs: (args: unknown) => void;
   apiKeyId?: string | null;
+  cacheDefaultMode?: "legacy" | "bypass" | null;
 }) {
+  // Per-key bypass: skip cache lookup entirely when the API key opts out.
+  if (cacheDefaultMode === "bypass") return null;
   if (semanticCacheEnabled && isCacheableForRead(body, clientRawRequest?.headers)) {
     const signature = generateSignature(
       model,
@@ -70,22 +76,29 @@ export async function checkSemanticCache({
       });
       trackPendingRequest(model, provider, connectionId, false);
       const cachedSse = stream ? synthesizeOpenAiSseFromJson(JSON.stringify(cached)) : "";
-      const cacheHitMetaHeaders = buildOmniRouteResponseMetaHeaders({
+      const headers: Record<string, string> = {
+        "Content-Type": cachedSse ? "text/event-stream" : "application/json",
+        [OMNIROUTE_RESPONSE_HEADERS.cache]: "HIT",
+        // Marker for latency measurement tools: this response served from cache
+        // has synthetic (near-zero) latency, not real upstream latency.
+        [OMNIROUTE_RESPONSE_HEADERS.cacheLatency]: "synthetic",
+      };
+      // A cache HIT serves WITHOUT an upstream call, so the incremental cost billed to
+      // the client is 0 (consumers that sum X-OmniRoute-Response-Cost must not charge for
+      // hits). The original/would-have-been cost is surfaced via X-OmniRoute-Cost-Saved.
+      attachOmniRouteMetaHeaders(headers, {
         provider,
         model,
         cacheHit: true,
         latencyMs: Date.now() - startTime,
         usage: cachedUsage,
-        costUsd: cachedCost,
+        costUsd: 0,
+        costSavedUsd: cachedCost,
       });
       return {
         success: true,
         response: new Response(cachedSse || JSON.stringify(cached), {
-          headers: {
-            "Content-Type": cachedSse ? "text/event-stream" : "application/json",
-            [OMNIROUTE_RESPONSE_HEADERS.cache]: "HIT",
-            ...cacheHitMetaHeaders,
-          },
+          headers,
         }),
       };
     }

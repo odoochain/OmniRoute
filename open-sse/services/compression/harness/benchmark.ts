@@ -187,6 +187,12 @@ export function engineToCompressFn(engineId: string): CompressFn {
   return async (text: string): Promise<string> => {
     const body: Record<string, unknown> = {
       messages: [{ role: "user", content: text }],
+      // #7746 follow-up: CCR only compresses for callers that advertise the
+      // omniroute_ccr_retrieve tool (otherwise its content-addressed marker is
+      // unresolvable). Real CCR traffic always carries this tool, so the
+      // benchmark must too, or CCR measures as a no-op. Other engines ignore
+      // the `tools` field, so this is inert for them.
+      tools: [{ type: "function", function: { name: "omniroute_ccr_retrieve" } }],
     };
 
     try {
@@ -199,6 +205,16 @@ export function engineToCompressFn(engineId: string): CompressFn {
 
       const messages = result.body["messages"];
       if (Array.isArray(messages) && messages.length > 0) {
+        // CCR may inject a leading [CCR protocol] system instruction, so the
+        // compressed user text is not necessarily messages[0]. Prefer the LAST
+        // message with string content (the user turn we fed in); fall back to
+        // the first string content otherwise.
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const c = (messages[i] as Record<string, unknown>)["content"];
+          if (typeof c === "string" && (messages[i] as Record<string, unknown>)["role"] !== "system") {
+            return c;
+          }
+        }
         const content = (messages[0] as Record<string, unknown>)["content"];
         if (typeof content === "string") return content;
       }
@@ -283,4 +299,36 @@ export function runBenchmarkGate(
     const gate = checkTokensPerTaskGate(report, baseline, tolerancePercent);
     return { engine, gate };
   });
+}
+
+// ── CLI helpers ────────────────────────────────────────────────────────────────
+
+/**
+ * Deterministic engines suitable for the sandbox A/B. `llmlingua` is excluded because its real
+ * compression is async-only and needs the MobileBERT ONNX model at runtime; add it once the
+ * model is provisioned (the framework is engine-agnostic).
+ */
+export const DEFAULT_BENCHMARK_ENGINES: string[] = [
+  "lite",
+  "caveman",
+  "aggressive",
+  "ultra",
+  "rtk",
+  "session-dedup",
+  "headroom",
+  "ccr",
+];
+
+/**
+ * Render an A/B summary (from {@link compareReports}) as a GitHub-flavored markdown table,
+ * best-first with the top engine bolded. Pure — used by the `bench:compression` CLI.
+ */
+export function formatBenchmarkTable(rows: EngineSummaryRow[]): string {
+  const header = "| Engine | Mean Savings % | Mean Retention | Total Compressed Tokens |";
+  const sep = "| --- | ---: | ---: | ---: |";
+  const body = rows.map((r, i) => {
+    const engine = i === 0 ? `**${r.engine}**` : r.engine;
+    return `| ${engine} | ${r.meanSavingsPercent.toFixed(1)} | ${r.meanRetention.toFixed(3)} | ${r.totalCompressedTokens} |`;
+  });
+  return [header, sep, ...body].join("\n");
 }

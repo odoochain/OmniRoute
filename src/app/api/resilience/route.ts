@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getSettings, updateSettings } from "@/lib/localDb";
+import { getCachedSettings, getSettings, updateSettings } from "@/lib/localDb";
 import {
   buildLegacyResilienceCompat,
   mergeResilienceSettings,
@@ -111,9 +111,15 @@ function normalizeLegacyPatch(body: JsonRecord): ResilienceSettingsPatch {
 }
 
 async function syncRuntimeSettings(resilienceSettings: ResilienceSettings) {
-  const { applyRequestQueueSettings } =
-    await import("@omniroute/open-sse/services/rateLimitManager");
+  const [{ applyRequestQueueSettings }, { setProviderQuotaOverrides }] = await Promise.all([
+    import("@omniroute/open-sse/services/rateLimitManager"),
+    import("@omniroute/open-sse/services/providerDefaultRateLimit"),
+  ]);
   await applyRequestQueueSettings(resilienceSettings.requestQueue);
+  // #6846 Phase 2: re-apply per-provider RPM/concurrency overrides on the hot
+  // path so a PATCH takes effect without a process restart. Mirrors the call in
+  // rateLimitManager.ts::initializeRateLimits() (startup).
+  setProviderQuotaOverrides(resilienceSettings.providerQuotaOverrides);
 }
 
 /**
@@ -121,7 +127,7 @@ async function syncRuntimeSettings(resilienceSettings: ResilienceSettings) {
  */
 export async function GET() {
   try {
-    const settings = await getSettings();
+    const settings = await getCachedSettings();
     const resilience = resolveResilienceSettings(settings);
 
     return NextResponse.json({
@@ -133,7 +139,10 @@ export async function GET() {
         maxRetries: resilience.waitForCooldown.maxRetries,
         maxRetryWaitSec: resilience.waitForCooldown.maxRetryWaitSec,
       },
+      comboCooldownWait: resilience.comboCooldownWait,
+      quotaShareConcurrencyLimit: resilience.quotaShareConcurrencyLimit,
       providerCooldown: resilience.providerCooldown,
+      providerQuotaOverrides: resilience.providerQuotaOverrides,
       legacy: buildLegacyResilienceCompat(resilience),
     });
   } catch (err: unknown) {
@@ -189,10 +198,27 @@ export async function PATCH(request) {
       ...(body.waitForCooldown
         ? { waitForCooldown: body.waitForCooldown as ResilienceSettingsPatch["waitForCooldown"] }
         : {}),
+      ...(body.comboCooldownWait
+        ? {
+            comboCooldownWait:
+              body.comboCooldownWait as ResilienceSettingsPatch["comboCooldownWait"],
+          }
+        : {}),
+      ...(body.quotaShareConcurrencyLimit
+        ? {
+            quotaShareConcurrencyLimit:
+              body.quotaShareConcurrencyLimit as ResilienceSettingsPatch["quotaShareConcurrencyLimit"],
+          }
+        : {}),
       ...(body.providerCooldown
         ? {
-            providerCooldown:
-              body.providerCooldown as ResilienceSettingsPatch["providerCooldown"],
+            providerCooldown: body.providerCooldown as ResilienceSettingsPatch["providerCooldown"],
+          }
+        : {}),
+      ...(body.providerQuotaOverrides
+        ? {
+            providerQuotaOverrides:
+              body.providerQuotaOverrides as ResilienceSettingsPatch["providerQuotaOverrides"],
           }
         : {}),
       ...normalizeLegacyPatch(body),
@@ -229,7 +255,10 @@ export async function PATCH(request) {
         maxRetries: nextResilience.waitForCooldown.maxRetries,
         maxRetryWaitSec: nextResilience.waitForCooldown.maxRetryWaitSec,
       },
+      comboCooldownWait: nextResilience.comboCooldownWait,
+      quotaShareConcurrencyLimit: nextResilience.quotaShareConcurrencyLimit,
       providerCooldown: nextResilience.providerCooldown,
+      providerQuotaOverrides: nextResilience.providerQuotaOverrides,
       legacy: buildLegacyResilienceCompat(nextResilience),
     });
   } catch (err: unknown) {

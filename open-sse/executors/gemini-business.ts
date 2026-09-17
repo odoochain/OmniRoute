@@ -34,7 +34,7 @@ import { makeExecutorErrorResult as makeErrorResult } from "../utils/error.ts";
 const GEMINI_BUSINESS_FETCH_TIMEOUT_MS = 60_000;
 
 const GEMINI_BUSINESS_USER_AGENT =
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 
 // Default entry URL — user can override via providerSpecificData.entryUrl
 const DEFAULT_ENTRY_URL = "https://business.gemini.google/home";
@@ -80,14 +80,7 @@ export class GeminiBusinessExecutor extends BaseExecutor {
     // Extract cookies from credentials — check apiKey/cookie first, then
     // try each __Secure-1PSID* key in providerSpecificData individually.
     // A user with only __Secure-1PSID (no PSIDTS) is still valid.
-    const directCookie =
-      readCredentialString(credentials?.apiKey) || readCredentialString(credentials?.cookie);
-    const psid =
-      readProviderSpecificString(credentials?.providerSpecificData, ["__Secure-1PSID", "cookie"]);
-    const psidts = readProviderSpecificString(credentials?.providerSpecificData, [
-      "__Secure-1PSIDTS",
-    ]);
-    const cookie = directCookie || [psid, psidts].filter(Boolean).join("; ");
+    const cookie = resolveGeminiBusinessCookie(credentials);
 
     if (!cookie) {
       return makeErrorResult(
@@ -110,7 +103,12 @@ export class GeminiBusinessExecutor extends BaseExecutor {
     const lastUserMsg = messages.filter((m) => m.role === "user").pop();
     const prompt = extractTextContent(lastUserMsg?.content);
     if (!prompt) {
-      return makeErrorResult(400, "No user message found in request body.", body, DEFAULT_ENTRY_URL);
+      return makeErrorResult(
+        400,
+        "No user message found in request body.",
+        body,
+        DEFAULT_ENTRY_URL
+      );
     }
 
     // Resolve model and its MODE_CATEGORY
@@ -137,10 +135,16 @@ export class GeminiBusinessExecutor extends BaseExecutor {
     };
 
     // Add SAPISID hash auth header if we can compute it (improves reliability on enterprise)
-    const sapisid = extractCookieValue(cookie, "SAPISID") || extractCookieValue(cookie, "__Secure-3PAPISID");
+    const sapisid =
+      extractCookieValue(cookie, "SAPISID") || extractCookieValue(cookie, "__Secure-3PAPISID");
     if (sapisid) {
       headers["Authorization"] = computeSapisidHash(sapisid, baseOrigin);
     }
+
+    // Cap the upstream call, and honor the caller's cancellation when there is one.
+    // `ExecuteInput.signal` is optional while mergeAbortSignals() needs two real signals,
+    // so fall back to the timeout alone — same guard the other web executors use.
+    const timeoutSignal = AbortSignal.timeout(GEMINI_BUSINESS_FETCH_TIMEOUT_MS);
 
     let response: Response;
     try {
@@ -148,7 +152,7 @@ export class GeminiBusinessExecutor extends BaseExecutor {
         method: "POST",
         headers,
         body: formBody.toString(),
-        signal: combineAbortSignals(signal, AbortSignal.timeout(GEMINI_BUSINESS_FETCH_TIMEOUT_MS)),
+        signal: signal ? mergeAbortSignals(signal, timeoutSignal) : timeoutSignal,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : "fetch failed";
@@ -272,9 +276,7 @@ export function parseStreamResponse(raw: string): string {
       const inner = JSON.parse(payload);
       const responseArray = inner?.[4]?.[0]?.[1];
       if (!Array.isArray(responseArray)) continue;
-      const chunkText = responseArray
-        .filter((c: unknown) => typeof c === "string")
-        .join("");
+      const chunkText = responseArray.filter((c: unknown) => typeof c === "string").join("");
       if (chunkText) textChunks.push(chunkText);
     } catch {
       // Skip unparseable lines (binary chunks, etc.)
@@ -359,10 +361,7 @@ function readCredentialString(value: unknown): string {
   return trimmed;
 }
 
-function readProviderSpecificString(
-  providerSpecificData: unknown,
-  keys: string[]
-): string {
+function readProviderSpecificString(providerSpecificData: unknown, keys: string[]): string {
   if (!providerSpecificData || typeof providerSpecificData !== "object") return "";
   const data = providerSpecificData as Record<string, unknown>;
   for (const key of keys) {
@@ -370,6 +369,15 @@ function readProviderSpecificString(
     if (typeof v === "string" && v.trim().length > 0) return v.trim();
   }
   return "";
+}
+
+export function resolveGeminiBusinessCookie(credentials: unknown): string {
+  if (!credentials || typeof credentials !== "object") return "";
+  const data = credentials as Record<string, unknown>;
+  const directCookie = readCredentialString(data.apiKey) || readCredentialString(data.cookie);
+  const psid = readProviderSpecificString(data.providerSpecificData, ["__Secure-1PSID", "cookie"]);
+  const psidts = readProviderSpecificString(data.providerSpecificData, ["__Secure-1PSIDTS"]);
+  return directCookie || [psid, psidts].filter(Boolean).join("; ");
 }
 
 function extractTextContent(content: unknown): string {

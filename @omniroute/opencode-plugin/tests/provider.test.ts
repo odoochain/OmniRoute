@@ -75,7 +75,7 @@ const apiAuth = (key: string, baseURL?: string): unknown =>
 
 test("createOmniRouteProviderHook: default providerId is 'omniroute'", () => {
   const hook = createOmniRouteProviderHook(undefined, { combosFetcher: async () => [] });
-  assert.equal(hook.id, "omniroute");
+  assert.equal(hook.id, "opencode-omniroute");
 });
 
 test("createOmniRouteProviderHook: custom providerId binds to hook.id (multi-instance)", () => {
@@ -87,8 +87,8 @@ test("createOmniRouteProviderHook: custom providerId binds to hook.id (multi-ins
     { providerId: "omniroute-local" },
     { combosFetcher: async () => [] }
   );
-  assert.equal(a.id, "omniroute-preprod");
-  assert.equal(b.id, "omniroute-local");
+  assert.equal(a.id, "opencode-omniroute-preprod");
+  assert.equal(b.id, "opencode-omniroute-local");
 });
 
 test("models: extracts apiKey from ctx.auth (type=api) and calls fetcher with it", async () => {
@@ -101,6 +101,12 @@ test("models: extracts apiKey from ctx.auth (type=api) and calls fetcher with it
   assert.equal(fetcher.callCount(), 1);
   assert.deepEqual(fetcher.callsBy()[0], ["https://or.example.com/v1", "sk-abc"]);
   assert.equal(Object.keys(out).length, 3);
+  // #6859: dynamic-hook catalog keys use the unprefixed omnirouteProviderId
+  // ("omniroute"), not the OC-gate-prefixed hook.id ("opencode-omniroute") —
+  // that prefix must never leak into anything OmniRoute's server parses.
+  // #10345/#10821: bare combo ids (owned_by: "combo") stay unprefixed —
+  // OpenCode looks up `-m <plugin>/<combo>` as model id `<combo>` under the
+  // plugin provider, so `claude-primary` here carries no provider prefix.
   assert.ok(out["claude-primary"]);
 });
 
@@ -152,8 +158,18 @@ test("models: maps a sample /v1/models entry to ModelV2 (sanity)", async () => {
     { fetcher, combosFetcher: async () => [] }
   );
   const out = await hook.models!({} as never, { auth: apiAuth("sk-abc") as never });
+  // #6859: dynamic-hook catalog keys/ids/providerID use the unprefixed
+  // omnirouteProviderId ("omniroute") — the OC-gate prefix ("opencode-")
+  // must stay OC-internal (hook.id / AuthHook.provider) and never leak into
+  // anything OmniRoute's own server parses for credential lookup.
+  // #10345/#10821: bare **combo** ids (owned_by: "combo", e.g.
+  // "claude-primary") must also stay unprefixed — OpenCode looks up
+  // `-m <plugin>/<combo>` as model id `<combo>` under the plugin provider.
   const claude = out["claude-primary"];
   assert.ok(claude, "claude-primary present");
+  // `mapRawModelToModelV2` leaves bare combo ids unprefixed (see
+  // src/index.ts mapRawModelToModelV2) so OC's `-m <plugin>/<combo>` lookup
+  // resolves the combo id directly.
   assert.equal(claude.id, "claude-primary");
   assert.equal(claude.name, "claude-primary");
   assert.equal(claude.providerID, "omniroute");

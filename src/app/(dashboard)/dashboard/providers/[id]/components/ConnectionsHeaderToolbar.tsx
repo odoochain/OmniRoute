@@ -10,12 +10,15 @@ type ConnectionsHeaderToolbarProps = {
   isCompatible: boolean;
   isCommandCode: boolean;
   isOAuth: boolean;
+  supportsDualAuth: boolean;
   providerSupportsPat: boolean;
   connections: any[]; // ConnectionRowConnection[]
   batchTesting: boolean;
   batchRetesting: boolean;
   retestingId: string | null;
   proxyConfig: any;
+  reorderingByAvailability: boolean;
+  handleReorderByAvailability: () => void | Promise<void>;
   // from useProviderSettings
   preferClaudeCodeForUnprefixedClaudeModels: boolean;
   claudeRoutingSettingsLoaded: boolean;
@@ -37,6 +40,8 @@ type ConnectionsHeaderToolbarProps = {
   gateConnectionFlow: (callback: () => void) => void;
   openApiKeyAddFlow: () => void;
   openPrimaryAddFlow: () => void;
+  connectVolcengineAccount?: () => void;
+  connectingVolcengineAccount?: boolean;
   openExternalLinkFlow: () => void;
   handleOpenCommandCodeConnect: () => void;
   commandCodeAuthState: { phase: string };
@@ -45,6 +50,7 @@ type ConnectionsHeaderToolbarProps = {
   onOpenImportCodex: () => void;
   onOpenImportClaude: () => void;
   onOpenImportGemini: () => void;
+  onOpenImportGrokCli: () => void;
   t: ProviderMessageTranslator;
 };
 
@@ -54,12 +60,15 @@ export default function ConnectionsHeaderToolbar({
   isCompatible,
   isCommandCode,
   isOAuth,
+  supportsDualAuth,
   providerSupportsPat,
   connections,
   batchTesting,
   batchRetesting,
   retestingId,
   proxyConfig,
+  reorderingByAvailability,
+  handleReorderByAvailability,
   preferClaudeCodeForUnprefixedClaudeModels,
   claudeRoutingSettingsLoaded,
   claudeRoutingSettingsLoadError,
@@ -79,6 +88,8 @@ export default function ConnectionsHeaderToolbar({
   gateConnectionFlow,
   openApiKeyAddFlow,
   openPrimaryAddFlow,
+  connectVolcengineAccount,
+  connectingVolcengineAccount,
   openExternalLinkFlow,
   handleOpenCommandCodeConnect,
   commandCodeAuthState,
@@ -87,6 +98,7 @@ export default function ConnectionsHeaderToolbar({
   onOpenImportCodex,
   onOpenImportClaude,
   onOpenImportGemini,
+  onOpenImportGrokCli,
   t,
 }: ConnectionsHeaderToolbarProps) {
   return (
@@ -102,9 +114,7 @@ export default function ConnectionsHeaderToolbar({
               "Route bare claude-* model IDs from Claude Code clients through the Claude Code account instead of asking for a provider prefix."
             )}
           >
-            <span className="material-symbols-outlined text-[14px] text-orange-500">
-              alt_route
-            </span>
+            <span className="material-symbols-outlined text-[14px] text-orange-500">alt_route</span>
             <span>
               {providerText(
                 t,
@@ -162,16 +172,14 @@ export default function ConnectionsHeaderToolbar({
               "Set a global Codex service mode, or leave accounts on their individual service-tier setting."
             )}
           >
-            <span>
-              {providerText(t, "providerDetailServiceModeLabel", "Global service mode:")}
-            </span>
+            <span>{providerText(t, "providerDetailServiceModeLabel", "Global service mode:")}</span>
             <select
               value={codexGlobalServiceMode}
               onChange={(event) =>
                 handleChangeCodexGlobalServiceMode(event.target.value as CodexGlobalServiceMode)
               }
               disabled={savingCodexGlobalServiceMode || !codexSettingsLoaded}
-              aria-label="Global Codex service mode"
+              aria-label={providerText(t, "globalCodexServiceMode", "Global Codex service mode")}
               className="rounded-md border border-border bg-bg px-2 py-1 text-xs text-text-main outline-none transition-colors focus:border-primary disabled:opacity-60"
             >
               {codexGlobalServiceModeOptions.map((option) => (
@@ -223,7 +231,9 @@ export default function ConnectionsHeaderToolbar({
       <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
         {connections.length > 0 && (
           <DistributeProxiesButton
-            onDistribute={async () => { await handleDistributeProxies(); }}
+            onDistribute={async () => {
+              await handleDistributeProxies();
+            }}
             disabled={batchTesting || !!retestingId}
           />
         )}
@@ -245,21 +255,43 @@ export default function ConnectionsHeaderToolbar({
             {batchTesting ? t("testing") : t("testAll")}
           </button>
         )}
+        {connections.length > 1 && (
+          <Button
+            size="sm"
+            variant="secondary"
+            icon="swap_vert"
+            loading={reorderingByAvailability}
+            disabled={batchTesting || !!retestingId}
+            onClick={() => void handleReorderByAvailability()}
+            title={providerText(
+              t,
+              "reorderByAvailabilityTitle",
+              "Reorder connections by availability"
+            )}
+          >
+            {providerText(t, "reorderByAvailability", "Reorder")}
+          </Button>
+        )}
         {!isCompatible ? (
           <>
-            {isCommandCode ? (
+            {isCommandCode || supportsDualAuth ? (
               <>
                 <Button
                   size="sm"
                   icon="open_in_new"
                   loading={
-                    commandCodeAuthState.phase === "starting" ||
-                    commandCodeAuthState.phase === "polling" ||
-                    commandCodeAuthState.phase === "applying"
+                    isCommandCode &&
+                    (commandCodeAuthState.phase === "starting" ||
+                      commandCodeAuthState.phase === "polling" ||
+                      commandCodeAuthState.phase === "applying")
                   }
-                  onClick={() => gateConnectionFlow(handleOpenCommandCodeConnect)}
+                  onClick={() =>
+                    gateConnectionFlow(
+                      isCommandCode ? handleOpenCommandCodeConnect : openPrimaryAddFlow
+                    )
+                  }
                 >
-                  Connect
+                  {providerText(t, "connect", "Connect")}
                 </Button>
                 <Button
                   size="sm"
@@ -267,25 +299,34 @@ export default function ConnectionsHeaderToolbar({
                   icon="add"
                   onClick={() => gateConnectionFlow(openApiKeyAddFlow)}
                 >
-                  Manual API key
+                  {providerText(t, "manualApiKey", "Manual API key")}
                 </Button>
               </>
             ) : (
               <>
-                <Button
-                  size="sm"
-                  icon="add"
-                  onClick={() => gateConnectionFlow(openPrimaryAddFlow)}
-                >
-                  {providerSupportsPat ? "Add PAT" : t("add")}
+                <Button size="sm" icon="add" onClick={() => gateConnectionFlow(openPrimaryAddFlow)}>
+                  {providerSupportsPat ? providerText(t, "addPat", "Add PAT") : t("add")}
                 </Button>
+                {(providerId === "volcengine-agent-plan" ||
+                  providerId === "volcengine-coding-plan") &&
+                  connectVolcengineAccount && (
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      icon="login"
+                      loading={connectingVolcengineAccount}
+                      onClick={() => gateConnectionFlow(connectVolcengineAccount)}
+                    >
+                      {providerText(t, "connectVolcengineAccount", "Connect Volcano Account")}
+                    </Button>
+                  )}
                 {providerId === "qoder" && (
                   <Button
                     size="sm"
                     variant="secondary"
                     onClick={() => gateConnectionFlow(onOpenOAuthModal)}
                   >
-                    Experimental OAuth
+                    {providerText(t, "experimentalOauth", "Experimental OAuth")}
                   </Button>
                 )}
                 {providerId === "codex" && (
@@ -295,7 +336,7 @@ export default function ConnectionsHeaderToolbar({
                     icon="menu_book"
                     onClick={() => onOpenCodexCliGuide()}
                   >
-                    Codex CLI Guide
+                    {providerText(t, "codexCliGuideButton", "Codex CLI Guide")}
                   </Button>
                 )}
                 {providerId === "codex" && (
@@ -305,7 +346,7 @@ export default function ConnectionsHeaderToolbar({
                     icon="share"
                     onClick={() => gateConnectionFlow(openExternalLinkFlow)}
                   >
-                    Adicionar Externo
+                    {providerText(t, "codexExternalLinkButton", "External Codex link")}
                   </Button>
                 )}
                 {providerId === "codex" && (
@@ -315,9 +356,7 @@ export default function ConnectionsHeaderToolbar({
                     icon="upload_file"
                     onClick={() => gateConnectionFlow(onOpenImportCodex)}
                   >
-                    {typeof (t as any).has === "function" && (t as any).has("importCodexAuth")
-                      ? t("importCodexAuth")
-                      : "Import auth"}
+                    {providerText(t, "importCodexAuth", "Import auth")}
                   </Button>
                 )}
                 {providerId === "claude" && (
@@ -327,21 +366,17 @@ export default function ConnectionsHeaderToolbar({
                     icon="upload_file"
                     onClick={() => gateConnectionFlow(onOpenImportClaude)}
                   >
-                    {typeof (t as any).has === "function" && (t as any).has("importClaudeAuth")
-                      ? t("importClaudeAuth")
-                      : "Import auth"}
+                    {providerText(t, "importClaudeAuth", "Import auth")}
                   </Button>
                 )}
-                {providerId === "gemini-cli" && (
+                {providerId === "grok-cli" && (
                   <Button
                     size="sm"
                     variant="secondary"
                     icon="upload_file"
-                    onClick={() => gateConnectionFlow(onOpenImportGemini)}
+                    onClick={() => gateConnectionFlow(onOpenImportGrokCli)}
                   >
-                    {typeof (t as any).has === "function" && (t as any).has("importGeminiAuth")
-                      ? t("importGeminiAuth")
-                      : "Import auth"}
+                    {providerText(t, "importGrokAuth", "Import auth")}
                   </Button>
                 )}
               </>
@@ -349,11 +384,7 @@ export default function ConnectionsHeaderToolbar({
           </>
         ) : (
           connections.length === 0 && (
-            <Button
-              size="sm"
-              icon="add"
-              onClick={() => gateConnectionFlow(openApiKeyAddFlow)}
-            >
+            <Button size="sm" icon="add" onClick={() => gateConnectionFlow(openApiKeyAddFlow)}>
               {t("add")}
             </Button>
           )

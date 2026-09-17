@@ -14,6 +14,8 @@ function defaultServerState(): AgentBridgeServerState {
     lastStartedAt: null,
     activeConns: 0,
     interceptedCount: 0,
+    dnsConfigured: false,
+    orphanedStateDetected: false,
   };
 }
 
@@ -64,6 +66,19 @@ export function normalizeAgentBridgeState(raw: unknown): AgentBridgePageData {
     if (typeof source.activeConns === "number") serverState.activeConns = source.activeConns;
     if (typeof source.interceptedCount === "number") {
       serverState.interceptedCount = source.interceptedCount;
+    }
+    if (typeof source.dnsConfigured === "boolean") serverState.dnsConfigured = source.dnsConfigured;
+    if (typeof source.orphanedStateDetected === "boolean") {
+      serverState.orphanedStateDetected = source.orphanedStateDetected;
+    }
+    if (typeof source.hasCachedPassword === "boolean") {
+      serverState.hasCachedPassword = source.hasCachedPassword;
+    }
+    if (typeof source.needsSudoPassword === "boolean") {
+      serverState.needsSudoPassword = source.needsSudoPassword;
+    }
+    if (typeof source.isWin === "boolean") {
+      serverState.isWin = source.isWin;
     }
   }
 

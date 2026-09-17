@@ -10,6 +10,7 @@ const harness = await createChatPipelineHarness("memory-pipeline");
 // The harness sets DATA_DIR before importing DB modules, so these must resolve after that.
 const { extractFactsFromText } = await import("../../src/lib/memory/extraction.ts");
 const { retrieveMemories } = await import("../../src/lib/memory/retrieval.ts");
+const { invalidateMemorySettingsCache } = await import("../../src/lib/memory/settings.ts");
 const { injectMemory, formatMemoryContext } = await import("../../src/lib/memory/injection.ts");
 const {
   BaseExecutor,
@@ -45,24 +46,29 @@ function dropFts5Artifacts() {
 test.beforeEach(async () => {
   BaseExecutor.RETRY_CONFIG.delayMs = 0;
   await resetStorage();
+  invalidateMemorySettingsCache();
   dropFts5Artifacts();
 });
 
 test.afterEach(async () => {
   BaseExecutor.RETRY_CONFIG.delayMs = harness.originalRetryDelayMs;
   await resetStorage();
+  invalidateMemorySettingsCache();
 });
 
 test.after(async () => {
   await harness.cleanup();
 });
 
-async function enableMemory(maxTokens = 400) {
+async function enableMemory(
+  maxTokens = 400,
+  strategy: "recent" | "semantic" | "hybrid" = "recent"
+) {
   await settingsDb.updateSettings({
     memoryEnabled: true,
     memoryMaxTokens: maxTokens,
     memoryRetentionDays: 30,
-    memoryStrategy: "recent",
+    memoryStrategy: strategy,
   });
 }
 
@@ -169,6 +175,7 @@ test("later requests inject retrieved memories into upstream messages", async ()
 
 test("memory search ranks query-relevant memories first", async () => {
   const apiKey = await seedApiKey();
+  await enableMemory(400, "hybrid");
 
   await memoryTools.omniroute_memory_add.handler({
     apiKeyId: apiKey.id,
@@ -205,6 +212,95 @@ test("memory search ranks query-relevant memories first", async () => {
   assert.equal(result.data.count, 2);
   assert.match(result.data.memories[0].content, /TypeScript/i);
   assert.ok(result.data.memories.every((memory) => /TypeScript|backend/i.test(memory.content)));
+});
+
+test("MCP memory tools fall back to caller principal id when apiKeyId is omitted", async () => {
+  const apiKey = await seedApiKey();
+  await enableMemory(400, "hybrid");
+
+  const prevEnvKey = process.env.OMNIROUTE_API_KEY;
+  process.env.OMNIROUTE_API_KEY = apiKey.key;
+  try {
+    const added = await memoryTools.omniroute_memory_add.handler({
+      sessionId: "mcp-auto",
+      type: "factual",
+      key: "pref:auto-owner",
+      content: "Written without an explicit apiKeyId.",
+      metadata: {},
+    });
+    assert.equal(added.success, true);
+    assert.equal(added.data.memory.apiKeyId, "env-key");
+
+    const rows = await listMemories({ apiKeyId: "env-key", sessionId: "mcp-auto" });
+    const list = Array.isArray(rows) ? rows : (rows.data ?? []);
+    assert.equal(list.length, 1);
+    assert.equal(list[0].key, "pref:auto-owner");
+
+    const searched = await memoryTools.omniroute_memory_search.handler({
+      query: "explicit apiKeyId",
+      limit: 5,
+    });
+    assert.equal(searched.success, true);
+    assert.equal(searched.data.count, 1);
+    assert.equal(searched.data.memories[0].apiKeyId, "env-key");
+  } finally {
+    if (prevEnvKey === undefined) {
+      delete process.env.OMNIROUTE_API_KEY;
+    } else {
+      process.env.OMNIROUTE_API_KEY = prevEnvKey;
+    }
+  }
+});
+
+// GHSA-cpv3-xr7r-xf8q / #11040: the resolved caller principal ALWAYS wins over a
+// caller-supplied `apiKeyId`, so a spoofed id in the tool arguments cannot write
+// into (or read from) another principal's store. Before #11040 the explicit
+// argument won and this test asserted the old behavior.
+test("MCP memory tools reject explicit apiKeyId that does not match caller principal", async () => {
+  await enableMemory(400, "hybrid");
+
+  const prevEnvKey = process.env.OMNIROUTE_API_KEY;
+  process.env.OMNIROUTE_API_KEY = "sk-other-principal";
+  try {
+    const added = await memoryTools.omniroute_memory_add.handler({
+      apiKeyId: "principal-b",
+      sessionId: "mcp-mismatch",
+      type: "factual",
+      key: "pref:cross-tenant",
+      content: "Must not leak into another principal's store.",
+      metadata: {},
+    });
+    assert.equal(added.success, true);
+    // The spoofed `principal-b` is discarded; the write lands on the caller
+    // principal resolved from OMNIROUTE_API_KEY (the synthesized "env-key" record).
+    assert.equal(added.data.memory.apiKeyId, "env-key");
+
+    // Nothing reached the spoofed principal's store.
+    const spoofedRows = await listMemories({
+      apiKeyId: "principal-b",
+      sessionId: "mcp-mismatch",
+    });
+    const spoofedList = Array.isArray(spoofedRows) ? spoofedRows : (spoofedRows.data ?? []);
+    assert.equal(spoofedList.length, 0);
+
+    // It is readable by the caller itself, so the entry was redirected, not dropped —
+    // this also proves the search path is live (a disabled store would make the
+    // assertion above vacuous).
+    const searched = await memoryTools.omniroute_memory_search.handler({
+      query: "cross-tenant",
+      limit: 5,
+    });
+    assert.equal(searched.success, true);
+    assert.equal(searched.data.count, 1);
+    assert.equal(searched.data.memories[0].apiKeyId, "env-key");
+    assert.equal(searched.data.memories[0].key, "pref:cross-tenant");
+  } finally {
+    if (prevEnvKey === undefined) {
+      delete process.env.OMNIROUTE_API_KEY;
+    } else {
+      process.env.OMNIROUTE_API_KEY = prevEnvKey;
+    }
+  }
 });
 
 test("memory injection respects the configured token budget", async () => {

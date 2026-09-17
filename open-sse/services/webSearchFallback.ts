@@ -1,7 +1,10 @@
 import { FORMATS } from "../translator/formats.ts";
 
 export const OMNIROUTE_WEB_SEARCH_FALLBACK_TOOL_NAME = "omniroute_web_search";
-const WEB_SEARCH_TOOL_TYPES = new Set(["web_search", "web_search_preview"]);
+// Prefix match — Anthropic sends date-suffixed variants (web_search_20250305, …).
+// The other two detectors (openai-responses/helpers.ts, webSearchRouting.ts) already
+// use /^web_search/ prefix matching; this aligns the fallback detector with them.
+const WEB_SEARCH_TOOL_TYPES = /^web_search/;
 const SEARCH_CONTEXT_DEFAULTS: Record<string, number> = {
   low: 5,
   medium: 8,
@@ -9,6 +12,10 @@ const SEARCH_CONTEXT_DEFAULTS: Record<string, number> = {
 };
 
 type JsonRecord = Record<string, unknown>;
+type WebSearchFallbackBody = JsonRecord & {
+  tools?: unknown;
+  tool_choice?: unknown;
+};
 
 export interface WebSearchFallbackPlan {
   enabled: boolean;
@@ -23,13 +30,13 @@ function toRecord(value: unknown): JsonRecord {
 function isBuiltInWebSearchTool(tool: unknown): tool is JsonRecord {
   const toolRecord = toRecord(tool);
   const toolType = typeof toolRecord.type === "string" ? toolRecord.type : "";
-  return WEB_SEARCH_TOOL_TYPES.has(toolType) && !toolRecord.function;
+  return WEB_SEARCH_TOOL_TYPES.test(toolType) && !toolRecord.function;
 }
 
 function isBuiltInWebSearchToolChoice(toolChoice: unknown): boolean {
   const choice = toRecord(toolChoice);
   const toolType = typeof choice.type === "string" ? choice.type : "";
-  return WEB_SEARCH_TOOL_TYPES.has(toolType);
+  return WEB_SEARCH_TOOL_TYPES.test(toolType);
 }
 
 function buildFallbackDescription(tool: JsonRecord): string {
@@ -129,16 +136,33 @@ function buildFallbackTool(tool: JsonRecord, targetFormat?: string | null): Json
   };
 }
 
+// Providers whose endpoint advertises Claude/Anthropic format but does NOT implement
+// Anthropic's typed server tools (web_search_20250305, …). For these the Claude -> Claude
+// bypass below must NOT apply: forwarding the native server tool makes the upstream 400
+// (MiniMax returns `invalid params, function name or parameters is empty (2013)`), so the
+// built-in web-search tool has to be converted to the omniroute_web_search function
+// fallback — which these models accept as a normal function tool (#4481).
+const CLAUDE_FORMAT_PROVIDERS_WITHOUT_SERVER_TOOLS = new Set(["minimax"]);
+
 export function supportsNativeWebSearchFallbackBypass({
+  provider,
   sourceFormat,
   targetFormat,
   nativeCodexPassthrough,
+  interceptSearchOverride,
 }: {
   provider?: string | null;
   sourceFormat?: string | null;
-  targetFormat: string | null | undefined;
+  targetFormat?: string | null;
   nativeCodexPassthrough: boolean;
+  // Per-model rule (#3384) — resolveInterceptSearch() in src/lib/db/interceptionRules.ts.
+  // true = force interception (never bypass); false = force native bypass; undefined =
+  // fall through to the native-bypass defaults below.
+  interceptSearchOverride?: boolean;
 }): boolean {
+  if (typeof interceptSearchOverride === "boolean") {
+    return !interceptSearchOverride;
+  }
   // Native Codex (OpenAI Responses) passthrough: the upstream runs web search itself.
   if (nativeCodexPassthrough) return true;
   // Gemini target: the Gemini translator maps built-in web search to googleSearch natively.
@@ -147,17 +171,22 @@ export function supportsNativeWebSearchFallbackBypass({
   // subscription driven by Claude Code) natively runs web_search_20250305. Forward the
   // native tool untouched instead of rewriting it to omniroute_web_search. Mirrors the
   // Codex/Gemini bypasses so every native-web-search provider is treated symmetrically.
-  if (sourceFormat === FORMATS.CLAUDE && targetFormat === FORMATS.CLAUDE) return true;
+  if (sourceFormat === FORMATS.CLAUDE && targetFormat === FORMATS.CLAUDE) {
+    // …except Anthropic-compatible providers that don't actually implement server tools.
+    if (provider && CLAUDE_FORMAT_PROVIDERS_WITHOUT_SERVER_TOOLS.has(provider)) return false;
+    return true;
+  }
   return false;
 }
 
-export function prepareWebSearchFallbackBody<T extends JsonRecord>(
+export function prepareWebSearchFallbackBody<T extends WebSearchFallbackBody>(
   body: T,
   options: {
     provider?: string | null;
     sourceFormat?: string | null;
     targetFormat?: string | null;
     nativeCodexPassthrough: boolean;
+    interceptSearchOverride?: boolean;
   }
 ): { body: T; fallback: WebSearchFallbackPlan } {
   const tools = Array.isArray(body.tools) ? body.tools : null;

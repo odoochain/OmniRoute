@@ -46,36 +46,12 @@ function listProjectFiles(relPath: string): string[] {
 }
 
 // ─── Pipeline Wiring ─────────────────────────────────
-
-describe("Pipeline Wiring — server-init.ts", () => {
-  const src = readProjectFile("src/server-init.ts");
-
-  it("should initialize compliance audit log", () => {
-    assert.ok(src, "src/server-init.ts should exist");
-    assert.match(src, /initAuditLog/);
-  });
-
-  it("should cleanup expired logs", () => {
-    assert.match(src, /cleanupExpiredLogs/);
-  });
-
-  it("should enforce secrets before startup", () => {
-    assert.match(src, /enforceSecrets/);
-  });
-
-  it("should enforce web runtime env before startup", () => {
-    assert.match(src, /enforceWebRuntimeEnv/);
-  });
-
-  it("should log server.start audit event", () => {
-    assert.match(src, /server\.start/);
-  });
-
-  it("should use the structured startup logger instead of direct console calls", () => {
-    assert.match(src, /createLogger\("server-init"\)/);
-    assert.doesNotMatch(src, /console\.(log|warn|error|info|debug)\(/);
-  });
-});
+//
+// src/server-init.ts was removed: it was never imported anywhere and duplicated
+// the wiring below, which is the boot path that actually runs (Next.js
+// instrumentation hook). See tests/unit/credential-health-boot-wiring.test.ts and
+// tests/unit/thinking-budget-boot-wiring-5312.test.ts for the incidents that
+// wiring into the dead module caused.
 
 describe("Pipeline Wiring — instrumentation-node.ts", () => {
   const src = readProjectFile("src/instrumentation-node.ts");
@@ -91,7 +67,7 @@ describe("Pipeline Wiring — instrumentation-node.ts", () => {
     // or it never runs in production. initArenaEloSync self-gates through the feature flag
     // resolver so ARENA_ELO_SYNC_ENABLED and dashboard overrides still apply.
     assert.match(src, /initArenaEloSync/);
-    assert.match(src, /const started = await initArenaEloSync\(\)/);
+    assert.match(src, /m\.initArenaEloSync\(\)/);
   });
 
   it("should initialize pricing + models.dev sync on the live startup path (self-gated, opt-in)", () => {
@@ -284,7 +260,11 @@ describe("API Routes — dashboard and tool consumers", () => {
     assert.match(globals, /--color-card:\s+#ffffff/);
     assert.match(globals, /--color-card:\s+#161b22/);
     assert.match(globals, /--color-card:\s+var\(--color-card\)/);
-    assert.match(requestLogger, /bg-black\/5 dark:bg-black\/20/);
+    // #4233 ("opaque tables D9") replaced the bg-black/5 tint — which lost to
+    // bg-surface via tailwind-merge — with the opaque bg-surface theme color.
+    // The intent here (request log surface stays opaque over theme colors) is now
+    // expressed by bg-surface itself.
+    assert.match(requestLogger, /bg-surface/);
     assert.doesNotMatch(requestLogger, /\/api\/logs\/active/);
   });
 
@@ -305,7 +285,7 @@ describe("API Routes — dashboard and tool consumers", () => {
   it("keeps legacy usage history and raw request-log APIs explicitly classified", () => {
     const usageStats = readProjectFile("src/shared/components/UsageStats.tsx");
     const apiReference = readProjectFile("docs/reference/API_REFERENCE.md");
-    const openApi = readProjectFile("docs/reference/openapi.yaml");
+    const openApi = readProjectFile("docs/openapi.yaml");
 
     assert.ok(usageStats, "UsageStats compatibility component should exist");
     assert.ok(apiReference, "API reference should exist");
@@ -355,7 +335,7 @@ describe("Dashboard Wiring — T05 payload rules", () => {
   const payloadRulesTabSrc = readProjectFile(
     "src/app/(dashboard)/dashboard/settings/components/PayloadRulesTab.tsx"
   );
-  const openapiSrc = readProjectFile("docs/reference/openapi.yaml");
+  const openapiSrc = readProjectFile("docs/openapi.yaml");
 
   it.skip("settings page should surface payload rules inside advanced settings", () => {
     assert.ok(settingsPageSrc, "settings page source should exist");
@@ -375,7 +355,7 @@ describe("Dashboard Wiring — T05 payload rules", () => {
   });
 
   it("openapi should document the payload rules management surface", () => {
-    assert.ok(openapiSrc, "docs/reference/openapi.yaml should exist");
+    assert.ok(openapiSrc, "docs/openapi.yaml should exist");
     assert.match(openapiSrc, /\/api\/settings\/payload-rules:/);
     assert.match(openapiSrc, /summary:\s+Get payload rules configuration/);
     assert.match(openapiSrc, /ManagementSessionAuth:/);
@@ -598,18 +578,15 @@ describe("Page Integration — provider test results privacy", () => {
   });
 });
 
-describe("Page Integration — legacy provider create route retirement", () => {
-  const legacyProviderNewSrc = readProjectFile(
-    "src/app/(dashboard)/dashboard/providers/new/page.tsx"
-  );
+describe("Page Integration — provider create route renders the onboarding wizard (#5427)", () => {
+  const providerNewSrc = readProjectFile("src/app/(dashboard)/dashboard/providers/new/page.tsx");
 
-  it("should redirect legacy /dashboard/providers/new to the canonical providers flow", () => {
-    assert.ok(
-      legacyProviderNewSrc,
-      "src/app/(dashboard)/dashboard/providers/new/page.tsx should exist"
-    );
-    assert.match(legacyProviderNewSrc, /redirect\("\/dashboard\/providers"\)/);
-    assert.doesNotMatch(legacyProviderNewSrc, /authMethod:\s*"api_key"/);
-    assert.doesNotMatch(legacyProviderNewSrc, /displayName/);
+  it("renders ProviderOnboardingWizard instead of redirecting (#5427)", () => {
+    // #5427 reversed the earlier redirect-stub retirement: /dashboard/providers/new now
+    // renders the previously-orphaned ProviderOnboardingWizard directly (auth enforced by
+    // the (dashboard) layout). The dedicated guard is tests/unit/onboarding-wizard-route-5427.
+    assert.ok(providerNewSrc, "src/app/(dashboard)/dashboard/providers/new/page.tsx should exist");
+    assert.match(providerNewSrc, /ProviderOnboardingWizard/);
+    assert.doesNotMatch(providerNewSrc, /redirect\("\/dashboard\/providers"\)/);
   });
 });

@@ -8,7 +8,7 @@
  * Leaf component: imports from shared, leaf helpers, and sibling components.
  * Never imports from ProviderDetailPageClient.
  */
-import React from "react";
+import React, { useState, useRef, useEffect } from "react";
 import { Badge } from "@/shared/components";
 import { providerText } from "../providerPageHelpers";
 import ModelCompatPopover from "./ModelCompatPopover";
@@ -21,12 +21,19 @@ import { ModelSourceBadge, type ModelCompatSavePatch } from "./ModelRow";
 export interface PassthroughModelRowProps {
   modelId: string;
   fullModel: string;
+  provider: string;
+  alias?: string | null;
+  // Upstream-provided friendly name (`name` in the /models payload). Gateways that
+  // expose opaque model ids (GUID-style presets) still send a readable name — show it
+  // instead of "Click to set alias" so the list is not a wall of hex.
+  displayName?: string | null;
   source?: string;
   isFree?: boolean;
   isHidden?: boolean;
   copied?: string;
   onCopy: (text: string, key: string) => void;
   onDeleteAlias?: () => void;
+  onSetAlias?: (alias: string) => void;
   t: (key: string, values?: Record<string, unknown>) => string;
   showDeveloperToggle?: boolean;
   effectiveModelNormalize: (modelId: string, protocol?: string) => boolean;
@@ -37,7 +44,7 @@ export interface PassthroughModelRowProps {
   onToggleHidden?: (modelId: string, hidden: boolean) => Promise<void>;
   togglingHidden?: boolean;
   onTestModel?: (modelId: string, fullModel: string) => Promise<void>;
-  testStatus?: "ok" | "error" | null;
+  testStatus?: "ok" | "error" | "quota" | null;
   testingModel?: boolean;
 }
 
@@ -48,18 +55,22 @@ export interface PassthroughModelRowProps {
 export default function PassthroughModelRow({
   modelId,
   fullModel,
+  alias,
+  displayName,
   source,
   isFree,
   isHidden,
   copied,
   onCopy,
   onDeleteAlias,
+  onSetAlias,
   t,
   showDeveloperToggle = true,
   effectiveModelNormalize,
   effectiveModelPreserveDeveloper,
   getUpstreamHeadersRecord,
   saveModelCompatFlags,
+  provider,
   compatDisabled,
   onToggleHidden,
   togglingHidden,
@@ -67,6 +78,48 @@ export default function PassthroughModelRow({
   testStatus,
   testingModel,
 }: PassthroughModelRowProps) {
+  const [editing, setEditing] = useState(false);
+  const [aliasValue, setAliasValue] = useState(alias || "");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Only useful when it actually differs from the id — otherwise we would just print
+  // the opaque id twice.
+  const upstreamName =
+    displayName && displayName !== modelId && displayName !== fullModel ? displayName : null;
+
+  useEffect(() => {
+    if (editing && inputRef.current) {
+      inputRef.current.focus();
+      inputRef.current.select();
+    }
+  }, [editing]);
+
+  const startEditing = () => {
+    setAliasValue(alias || "");
+    setEditing(true);
+  };
+
+  const handleAliasSubmit = () => {
+    const trimmed = aliasValue.trim();
+    if (trimmed && trimmed !== alias) {
+      onSetAlias?.(trimmed);
+    } else if (!trimmed && alias) {
+      onDeleteAlias?.();
+    }
+    setEditing(false);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      handleAliasSubmit();
+    }
+    if (e.key === "Escape") {
+      setAliasValue(alias || "");
+      setEditing(false);
+    }
+  };
+
   return (
     <div
       className={`flex min-w-0 flex-col gap-2 rounded-lg border border-border px-3.5 py-3 transition-opacity hover:bg-sidebar/50 ${
@@ -86,6 +139,38 @@ export default function PassthroughModelRow({
         >
           {fullModel}
         </code>
+        {onSetAlias && (
+          <span className="flex min-w-0 items-center text-[9px] gap-1">
+            {editing ? (
+              <input
+                ref={inputRef}
+                type="text"
+                value={aliasValue}
+                onChange={(e) => setAliasValue(e.target.value)}
+                onBlur={handleAliasSubmit}
+                onKeyDown={handleKeyDown}
+                placeholder={providerText(t, "aliasInputPlaceholder", "alias name")}
+                className="bg-surface border border-primary/50 rounded px-1 py-0.5 text-[9px] text-text-main outline-none w-24"
+              />
+            ) : (
+              <span
+                className={`truncate text-[9px] italic cursor-pointer hover:text-primary transition-colors ${alias ? "text-primary/80" : "text-text-muted/70"}`}
+                onClick={startEditing}
+                title={
+                  alias
+                    ? providerText(t, "clickToEditAlias", "Alias: {alias} (click to edit)", {
+                        alias,
+                      })
+                    : upstreamName
+                      ? `${upstreamName} — ${providerText(t, "clickToSetAlias", "Click to set alias")}`
+                      : providerText(t, "clickToSetAlias", "Click to set alias")
+                }
+              >
+                {alias || upstreamName || providerText(t, "clickToSetAlias", "Click to set alias")}
+              </span>
+            )}
+          </span>
+        )}
       </div>
       <div className="flex min-w-0 items-center justify-between gap-2">
         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
@@ -110,15 +195,17 @@ export default function PassthroughModelRow({
             <button
               onClick={() => onTestModel(modelId, fullModel)}
               disabled={testingModel}
-              className={`rounded p-0.5 hover:bg-sidebar transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${testStatus === "ok" ? "text-green-500" : testStatus === "error" ? "text-red-500" : "text-text-muted hover:text-primary"}`}
+              className={`rounded p-0.5 hover:bg-sidebar transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${testStatus === "ok" ? "text-green-500" : testStatus === "quota" ? "text-amber-500" : testStatus === "error" ? "text-red-500" : "text-text-muted hover:text-primary"}`}
               title={
                 testingModel
                   ? t("testingModel")
                   : testStatus === "ok"
                     ? "OK"
-                    : testStatus === "error"
-                      ? "Error"
-                      : t("testModel")
+                    : testStatus === "quota"
+                      ? t("modelTestQuotaTooltip")
+                      : testStatus === "error"
+                        ? providerText(t, "errorShort", "Error")
+                        : t("testModel")
               }
             >
               {testingModel ? (
@@ -127,6 +214,8 @@ export default function PassthroughModelRow({
                 </span>
               ) : testStatus === "ok" ? (
                 <span className="material-symbols-outlined text-sm">check_circle</span>
+              ) : testStatus === "quota" ? (
+                <span className="material-symbols-outlined text-sm">warning</span>
               ) : testStatus === "error" ? (
                 <span className="material-symbols-outlined text-sm">error</span>
               ) : (
@@ -152,6 +241,8 @@ export default function PassthroughModelRow({
           )}
           <ModelCompatPopover
             t={t}
+            providerId={provider}
+            modelId={modelId}
             effectiveModelNormalize={(p) => effectiveModelNormalize(modelId, p)}
             effectiveModelPreserveDeveloper={(p) => effectiveModelPreserveDeveloper(modelId, p)}
             getUpstreamHeadersRecord={getUpstreamHeadersRecord}

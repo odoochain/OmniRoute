@@ -26,10 +26,12 @@ import {
   providerText,
   testAllResultsText,
   evaluateTestAllEntry,
+  shouldSwitchToVisibleFilter,
   type ProviderMessageTranslator,
   type CompatByProtocolMap,
 } from "../providerPageHelpers";
 import { useNotificationStore } from "@/store/notificationStore";
+import { extractApiErrorMessage } from "@/shared/http/apiErrorMessage";
 
 type NotifyStore = ReturnType<typeof useNotificationStore>;
 
@@ -68,7 +70,7 @@ export interface UseModelVisibilityHandlersReturn {
   clearingModels: boolean;
   modelFilter: string;
   testingModelId: string | null;
-  modelTestStatus: Record<string, "ok" | "error">;
+  modelTestStatus: Record<string, "ok" | "error" | "quota">;
   testingAll: boolean;
   testProgress: { done: number; total: number } | null;
   autoHideFailed: boolean;
@@ -78,11 +80,7 @@ export interface UseModelVisibilityHandlersReturn {
   setAutoHideFailed: (v: boolean) => void;
   setVisibilityFilter: (v: "all" | "visible" | "hidden") => void;
   saveModelCompatFlags: (modelId: string, patch: ModelCompatSavePatch) => Promise<void>;
-  handleToggleModelHidden: (
-    providerKey: string,
-    modelId: string,
-    hidden: boolean
-  ) => Promise<void>;
+  handleToggleModelHidden: (providerKey: string, modelId: string, hidden: boolean) => Promise<void>;
   handleBulkToggleModelHidden: (
     providerKey: string,
     modelIds: string[],
@@ -93,7 +91,7 @@ export interface UseModelVisibilityHandlersReturn {
   handleTestAll: (targets: Array<{ modelId: string; fullModel: string }>) => Promise<void>;
   /** Apply a model's test-all result to the per-row status icon (used by the
    *  passthrough section, which runs its own test-all loop). */
-  onModelTestStatusChange: (modelId: string, status: "ok" | "error") => void;
+  onModelTestStatusChange: (modelId: string, status: "ok" | "error" | "quota") => void;
 }
 
 // ──── hook ───────────────────────────────────────────────────────────────────
@@ -112,16 +110,16 @@ export function useModelVisibilityHandlers({
 }: UseModelVisibilityHandlersParams): UseModelVisibilityHandlersReturn {
   const [compatSavingModelId, setCompatSavingModelId] = useState<string | null>(null);
   const [togglingModelId, setTogglingModelId] = useState<string | null>(null);
-  const [bulkVisibilityAction, setBulkVisibilityAction] = useState<
-    "select" | "deselect" | null
-  >(null);
+  const [bulkVisibilityAction, setBulkVisibilityAction] = useState<"select" | "deselect" | null>(
+    null
+  );
   const [clearingModels, setClearingModels] = useState(false);
   const [modelFilter, setModelFilter] = useState("");
   const [testingModelId, setTestingModelId] = useState<string | null>(null);
-  const [modelTestStatus, setModelTestStatus] = useState<Record<string, "ok" | "error">>({});
+  const [modelTestStatus, setModelTestStatus] = useState<Record<string, "ok" | "error" | "quota">>({});
   const [testingAll, setTestingAll] = useState(false);
   const [testProgress, setTestProgress] = useState<{ done: number; total: number } | null>(null);
-  const [autoHideFailed, setAutoHideFailed] = useState(true);
+  const [autoHideFailed, setAutoHideFailed] = useState(false);
   const [visibilityFilter, setVisibilityFilter] = useState<"all" | "visible" | "hidden">("all");
 
   const providerAliasEntries = useMemo(
@@ -303,25 +301,29 @@ export function useModelVisibilityHandlers({
       const data = await res.json();
       if (res.ok && data.status === "ok") {
         notify.success(
-          providerText(t, "testModelSuccess", `Model ${modelId} is working. Latency: ${data.latencyMs}ms`, {
-            modelId,
-            latencyMs: data.latencyMs,
-          })
+          providerText(
+            t,
+            "testModelSuccess",
+            `Model ${modelId} is working. Latency: ${data.latencyMs}ms`,
+            {
+              modelId,
+              latencyMs: data.latencyMs,
+            }
+          )
         );
         setModelTestStatus((prev) => ({ ...prev, [modelId]: "ok" }));
       } else {
-        notify.error(data.error || "Model test failed");
+        // extractApiErrorMessage coerces any object-shaped `error` (e.g. a Zod
+        // format object) to a string so notify.error never hands the toast a
+        // non-string child (React #31 → frozen page).
+        notify.error(
+          extractApiErrorMessage(data, providerText(t, "modelTestFailed", "Model test failed"))
+        );
         setModelTestStatus((prev) => ({ ...prev, [modelId]: "error" }));
-        // Hidden flag keyed by providerId — same as the manual eye toggle and the read
-        // (fetchProviderModelMeta). providerStorageAlias wrote it under the alias while the
-        // read looked under the canonical id, so auto-hide never reflected.
-        await handleToggleModelHidden(providerId, modelId, true);
       }
     } catch (err) {
-      notify.error("Network error testing model");
+      notify.error(providerText(t, "modelTestNetworkError", "Network error testing model"));
       setModelTestStatus((prev) => ({ ...prev, [modelId]: "error" }));
-      // Hidden flag keyed by providerId (see the test-failure branch above).
-      await handleToggleModelHidden(providerId, modelId, true);
     } finally {
       setTestingModelId(null);
     }
@@ -352,7 +354,7 @@ export function useModelVisibilityHandlers({
               results?: Record<
                 string,
                 {
-                  status?: "ok" | "error";
+                  status?: "ok" | "error" | "slow";
                   rateLimited?: boolean;
                   isTimeout?: boolean;
                   error?: string;
@@ -370,8 +372,12 @@ export function useModelVisibilityHandlers({
 
             const entry = result.results?.[fullModel];
             const outcome = evaluateTestAllEntry(entry, autoHideFailed);
-            // Paint the per-model icon green/red, same as the single-model ▶ test.
-            setModelTestStatus((prev) => ({ ...prev, [modelId]: outcome.status }));
+            // #9511: paint "quota" status for quota-exhausted models (amber badge),
+            // "ok" for healthy, "error" for genuine failures.
+            setModelTestStatus((prev) => ({
+              ...prev,
+              [modelId]: outcome.isQuota ? "quota" : outcome.status,
+            }));
             if (outcome.status === "ok") {
               ok++;
             } else {
@@ -396,6 +402,14 @@ export function useModelVisibilityHandlers({
     notify.info(testAllResultsText(t, ok, ok + error));
     if (hiddenCount > 0) {
       notify.info(providerText(t, "testAllFailedHidden", "{count} hidden", { count: hiddenCount }));
+      // Bug #4887: switch to "visible" so the models we just auto-hid disappear
+      // on-screen — parity with PassthroughModelsSection (#3610). Without this,
+      // failed models were hidden in the DB but stayed visible under the "All"
+      // filter, so on GLM (and other OAuth providers using this hook's handleTestAll)
+      // it looked like nothing was hidden.
+      if (shouldSwitchToVisibleFilter({ autoHideFailed, hiddenCount })) {
+        setVisibilityFilter("visible");
+      }
     }
     setTestingAll(false);
     setTestProgress(null);
@@ -423,7 +437,7 @@ export function useModelVisibilityHandlers({
     handleClearAllModels,
     onTestModel,
     handleTestAll,
-    onModelTestStatusChange: (modelId: string, status: "ok" | "error") =>
+    onModelTestStatusChange: (modelId: string, status: "ok" | "error" | "quota") =>
       setModelTestStatus((prev) => ({ ...prev, [modelId]: status })),
   };
 }

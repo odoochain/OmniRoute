@@ -3,15 +3,42 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { ProviderCredentials } from "../../open-sse/executors/base.ts";
 
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-responses-handler-"));
 process.env.DATA_DIR = TEST_DATA_DIR;
 
 const core = await import("../../src/lib/db/core.ts");
 const { handleResponsesCore } = await import("../../open-sse/handlers/responsesHandler.ts");
-const { COMMAND_CODE_VERSION } = await import("../../open-sse/executors/commandCode.ts");
 
 const originalFetch = globalThis.fetch;
+
+type JsonRecord = Record<string, unknown>;
+type CapturedBody = JsonRecord & {
+  messages?: Array<JsonRecord & { content?: unknown; role?: unknown }>;
+  params?: JsonRecord;
+  tools?: Array<JsonRecord & { function?: JsonRecord }>;
+};
+type CapturedCall = {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  body: CapturedBody;
+};
+type ResponseFactory = (call: CapturedCall, calls: CapturedCall[]) => Response | Promise<Response>;
+type InvokeResponsesCoreOptions = {
+  body?: unknown;
+  provider?: string;
+  model?: string;
+  credentials?: ProviderCredentials;
+  responseFactory?: ResponseFactory;
+  signal?: AbortSignal;
+};
+type ErrorPayload = {
+  error?: {
+    message?: string;
+  };
+};
 
 function noopLog() {
   return {
@@ -22,12 +49,20 @@ function noopLog() {
   };
 }
 
-function toPlainHeaders(headers: any) {
+function toPlainHeaders(headers: HeadersInit | undefined): Record<string, string> {
   if (!headers) return {};
   if (headers instanceof Headers) return Object.fromEntries(headers.entries());
   return Object.fromEntries(
     Object.entries(headers).map(([key, value]) => [key, value == null ? "" : String(value)])
   );
+}
+
+function parseCapturedBody(body: BodyInit | null | undefined): CapturedBody {
+  if (!body) return {};
+  const parsed = JSON.parse(String(body)) as unknown;
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? (parsed as CapturedBody)
+    : {};
 }
 
 function buildOpenAISseResponse(text = "hello") {
@@ -56,7 +91,37 @@ function buildOpenAISseResponse(text = "hello") {
   );
 }
 
-function buildJsonResponse(status: number, payload: any) {
+function buildToolCallSseResponse(name: string, argumentsJson: string) {
+  return new Response(
+    [
+      `data: ${JSON.stringify({
+        id: "chatcmpl-tool",
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: "call_1",
+                  type: "function",
+                  function: { name, arguments: argumentsJson },
+                },
+              ],
+            },
+            finish_reason: "tool_calls",
+          },
+        ],
+      })}`,
+      "",
+      "data: [DONE]",
+      "",
+    ].join("\n"),
+    { status: 200, headers: { "Content-Type": "text/event-stream" } }
+  );
+}
+
+function buildJsonResponse(status: number, payload: unknown) {
   return new Response(JSON.stringify(payload), {
     status,
     headers: { "Content-Type": "application/json" },
@@ -65,7 +130,7 @@ function buildJsonResponse(status: number, payload: any) {
 
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -76,22 +141,15 @@ async function invokeResponsesCore({
   credentials,
   responseFactory,
   signal,
-}: {
-  body?: any;
-  provider?: string;
-  model?: string;
-  credentials?: any;
-  responseFactory?: any;
-  signal?: AbortSignal;
-} = {}) {
-  const calls: any[] = [];
+}: InvokeResponsesCoreOptions = {}) {
+  const calls: CapturedCall[] = [];
 
   globalThis.fetch = async (url, init = {}) => {
     const call = {
       url: String(url),
       method: init.method || "GET",
       headers: toPlainHeaders(init.headers),
-      body: init.body ? JSON.parse(String(init.body)) : null,
+      body: parseCapturedBody(init.body),
     };
     calls.push(call);
     return responseFactory ? responseFactory(call, calls) : buildOpenAISseResponse();
@@ -127,7 +185,7 @@ test.afterEach(async () => {
 test.after(async () => {
   globalThis.fetch = originalFetch;
   await resetStorage();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("handleResponsesCore converts Responses API input, instructions, tools, metadata, and forces streaming", async () => {
@@ -166,6 +224,60 @@ test("handleResponsesCore converts Responses API input, instructions, tools, met
   assert.equal("store" in call.body, false);
 });
 
+test("handleResponsesCore preserves Kimi K3 reasoning through provider translation", async () => {
+  const body = {
+    model: "k3-256k",
+    reasoning: { effort: "high" },
+    input: [
+      { role: "user", content: [{ type: "input_text", text: "Call search." }] },
+      {
+        type: "reasoning",
+        content: [{ type: "reasoning_text", text: "I should search first." }],
+      },
+      {
+        type: "function_call",
+        call_id: "call_1",
+        name: "search",
+        arguments: "{}",
+      },
+      { type: "function_call_output", call_id: "call_1", output: "found" },
+    ],
+  };
+
+  const coding = await invokeResponsesCore({
+    body,
+    provider: "kimi-coding-apikey",
+    model: "k3-256k",
+  });
+  assert.deepEqual(coding.call.body.messages?.[1]?.content?.[0], {
+    type: "thinking",
+    thinking: "I should search first.",
+  });
+
+  const native = await invokeResponsesCore({
+    body: { ...body, model: "kimi-k3", reasoning: { effort: "max" } },
+    provider: "moonshot",
+    model: "kimi-k3",
+  });
+  assert.equal(native.call.body.messages?.[1]?.reasoning_content, "I should search first.");
+});
+
+test("handleResponsesCore maps unsupported Kimi K3 xhigh effort to max", async () => {
+  const { call, result } = await invokeResponsesCore({
+    body: {
+      model: "k3-256k",
+      reasoning: { effort: "xhigh", summary: "auto" },
+      input: "Reply with OK.",
+    },
+    provider: "kimi-coding-apikey",
+    model: "k3-256k",
+  });
+
+  assert.equal(result.success, true);
+  assert.deepEqual(call.body.thinking, { type: "enabled" });
+  assert.deepEqual(call.body.output_config, { effort: "max" });
+});
+
 test("handleResponsesCore strips previous_response_id by default and handles empty input arrays", async () => {
   const { call, result } = await invokeResponsesCore({
     body: {
@@ -179,7 +291,11 @@ test("handleResponsesCore strips previous_response_id by default and handles emp
   assert.equal(result.success, true);
   assert.equal(call.body.previous_response_id, undefined);
   assert.equal(call.body.metadata, undefined);
-  assert.deepEqual(call.body.messages, []);
+  // Empty input[] now injects a placeholder user message to avoid upstream
+  // "400: at least one message is required" rejections (9router#419).
+  assert.equal(Array.isArray(call.body.messages), true);
+  assert.equal(call.body.messages.length, 1);
+  assert.equal(call.body.messages[0].role, "user");
   assert.equal(call.body.stream, true);
 });
 
@@ -237,26 +353,31 @@ test("handleResponsesCore transforms Command Code executor SSE through Responses
       input: "hello command code",
     },
     responseFactory() {
+      // /provider/v1/chat/completions returns standard OpenAI SSE (#10265).
+      const chunk = (delta: Record<string, unknown>) =>
+        `data: ${JSON.stringify({
+          id: "c1",
+          object: "chat.completion.chunk",
+          model: "gpt-5.4-mini",
+          choices: [{ index: 0, delta }],
+        })}\n\n`;
       return new Response(
         [
-          `data: ${JSON.stringify({ type: "text-delta", text: "command" })}`,
-          "",
-          `data: ${JSON.stringify({ type: "reasoning-delta", text: "thinking" })}`,
-          "",
-          `data: ${JSON.stringify({ type: "finish", finishReason: "stop" })}`,
-          "",
-        ].join("\n"),
-        { status: 200, headers: { "Content-Type": "application/x-ndjson" } }
+          chunk({ role: "assistant" }),
+          chunk({ content: "command" }),
+          chunk({}),
+        ].join("") + "data: [DONE]\n\n",
+        { status: 200, headers: { "Content-Type": "text/event-stream" } }
       );
     },
   });
 
   assert.equal(result.success, true);
-  assert.equal(call.url, "https://api.commandcode.ai/alpha/generate");
+  assert.equal(call.url, "https://api.commandcode.ai/provider/v1/chat/completions");
   assert.equal(call.headers.Authorization, "Bearer cc_test_key");
-  assert.equal(call.headers["x-command-code-version"], COMMAND_CODE_VERSION);
-  assert.equal(call.body.params.model, "gpt-5.4-mini");
-  assert.equal(call.body.params.stream, true);
+  assert.equal(call.headers["x-command-code-version"], undefined);
+  assert.equal(call.body.model, "gpt-5.4-mini");
+  assert.equal(call.body.stream, true);
 
   const sse = await result.response.text();
   assert.match(sse, /event: response\.created/);
@@ -266,8 +387,8 @@ test("handleResponsesCore transforms Command Code executor SSE through Responses
   assert.match(sse, /data: \[DONE\]/);
 });
 
-test("handleResponsesCore propagates upstream failures from chatCore unchanged", async () => {
-  const { result } = await invokeResponsesCore({
+test("handleResponsesCore propagates upstream failures without retrying", async () => {
+  const { result, calls } = await invokeResponsesCore({
     body: {
       model: "gpt-4o-mini",
       input: "hello",
@@ -281,8 +402,9 @@ test("handleResponsesCore propagates upstream failures from chatCore unchanged",
 
   assert.equal(result.success, false);
   assert.equal(result.status, 401);
+  assert.equal(calls.length, 1);
 
-  const payload = (await result.response.json()) as any;
+  const payload = (await result.response.json()) as ErrorPayload;
   assert.equal(payload.error.message, "[401]: unauthorized");
 });
 
@@ -308,6 +430,77 @@ test("handleResponsesCore rejects invalid Responses API input that cannot be tra
     (error) =>
       error instanceof Error && error.message.includes("file_search tool type is not supported")
   );
+});
+
+test("handleResponsesCore restores custom tools declared through additional_tools", async () => {
+  const { result, call } = await invokeResponsesCore({
+    body: {
+      model: "gpt-4o-mini",
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "ping" }] },
+        {
+          type: "additional_tools",
+          tools: [{ type: "custom", name: "exec", description: "Execute freeform code" }],
+        },
+      ],
+    },
+    responseFactory: () => buildToolCallSseResponse("exec", '{"input":"text(\\"pong\\")"}'),
+  });
+
+  assert.equal(call.body.tools[0].type, "function");
+  const sse = await result.response.text();
+  assert.match(sse, /"type":"custom_tool_call"/);
+  assert.match(sse, /"input":"text\(\\"pong\\"\)"/);
+  assert.doesNotMatch(sse, /"type":"function_call","arguments"/);
+});
+
+test("handleResponsesCore preserves top-level tool precedence for custom-name collisions", async () => {
+  const { result } = await invokeResponsesCore({
+    body: {
+      model: "gpt-4o-mini",
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "ping" }] },
+        {
+          type: "additional_tools",
+          tools: [{ type: "custom", name: "exec", description: "Shadowed custom tool" }],
+        },
+      ],
+      tools: [
+        {
+          type: "function",
+          name: "exec",
+          description: "Explicit function tool",
+          parameters: { type: "object", properties: {} },
+        },
+      ],
+    },
+    responseFactory: () => buildToolCallSseResponse("exec", "{}"),
+  });
+
+  const sse = await result.response.text();
+  assert.match(sse, /"type":"function_call"/);
+  assert.doesNotMatch(sse, /"type":"custom_tool_call"/);
+});
+
+test("handleResponsesCore restores custom tools nested in namespaces", async () => {
+  const { result } = await invokeResponsesCore({
+    body: {
+      model: "gpt-4o-mini",
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "ping" }] }],
+      tools: [
+        {
+          type: "namespace",
+          name: "commands",
+          tools: [{ type: "custom", name: "exec", description: "Execute freeform code" }],
+        },
+      ],
+    },
+    responseFactory: () => buildToolCallSseResponse("exec", '{"input":"pong"}'),
+  });
+
+  const sse = await result.response.text();
+  assert.match(sse, /"type":"custom_tool_call"/);
+  assert.doesNotMatch(sse, /"type":"function_call","arguments"/);
 });
 
 test("handleResponsesCore injects SSE keepalive frames for Responses streams", async (t) => {

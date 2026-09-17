@@ -33,7 +33,7 @@ const { MemoryEngineStatusSchema } = await import("../../src/shared/schemas/memo
 function cleanup() {
   core.resetDbInstance();
   if (fs.existsSync(TEST_DATA_DIR)) {
-    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
@@ -41,7 +41,7 @@ function cleanup() {
 test.afterEach(() => cleanup());
 test.after(() => {
   if (fs.existsSync(TEST_DATA_DIR)) {
-    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -127,6 +127,41 @@ test("engineStatus(): rerank section when not configured", async () => {
   assert.equal(status.rerank.enabled, false, "rerank.enabled should be false by default");
   assert.equal(status.rerank.available, false, "rerank.available should be false when disabled");
   assert.equal(typeof status.rerank.reason, "string", "rerank.reason must be a string");
+});
+
+test("engineStatus(): detail strings are English, not mixed Portuguese (#5596)", async () => {
+  core.getDbInstance();
+
+  const { engineStatus } = await import("../../src/lib/memory/retrieval.ts");
+  const status = await engineStatus();
+
+  // Exact English values for the default (no-config, vec-disabled) state the
+  // reporter saw rendered in Portuguese next to English UI labels.
+  assert.equal(status.embedding.reason, "auto: no embedding source available");
+  assert.equal(status.vectorStore.reason, "sqlite-vec not available — using FTS5 only");
+  assert.equal(status.rerank.reason, "rerank disabled");
+
+  // Guard: no leftover Portuguese in any surfaced reason string.
+  const ptWords = [
+    "não",
+    "disponível",
+    "configurado",
+    "desabilitado",
+    "nenhuma",
+    "desconhecida",
+    "habilitado",
+    "degradado",
+    "selecionado",
+  ];
+  for (const reason of [
+    status.embedding.reason,
+    status.vectorStore.reason,
+    status.rerank.reason,
+  ]) {
+    for (const w of ptWords) {
+      assert.ok(!reason.includes(w), `reason "${reason}" still contains Portuguese "${w}"`);
+    }
+  }
 });
 
 test("engineStatus(): no throw when called multiple times", async () => {

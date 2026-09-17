@@ -61,6 +61,11 @@ function hasImporter(mod: string, roots: string[]): boolean {
     new RegExp(`(?:import|require)\\s*\\(\\s*['""][^'"]+/db/${escaped}['"]`),
     // dynamic template: import(`…/db/<mod>.ts`) — bin/cli/runtime.mjs uses template literals
     new RegExp(`import\\s*\\(\`[^'"\`]+/db/${escaped}\\.ts\`\\)`),
+    // dynamic via file:// URL helper: import(projectFileUrl("…/db/<mod>.ts")) —
+    // bin/cli/runtime.mjs since #11238 (Windows-safe file:// dynamic imports).
+    new RegExp(
+      `import\\s*\\(\\s*projectFileUrl\\(\\s*['""][^'"]+/db/${escaped}\\.ts['"]\\s*\\)\\s*\\)`
+    ),
     // relative import within db/: from "./<mod>" or from "./<mod>"
     new RegExp(`from\\s+['"]\\.\\.?/${escaped}['"]`),
   ];
@@ -99,7 +104,6 @@ const TYPE_ONLY = new Set(["_rowTypes"]);
 // They remain in INTENTIONALLY_INTERNAL for schema-reservation reasons.
 // Flag them but do NOT fail — a separate decision is needed to remove them.
 const DOCUMENTED_DEAD = new Set([
-  "compressionScheduler", // DEAD?: 0 production importers as of 2026-06-11
   "discovery", // DEAD?: 0 importers; lib/discovery/index.ts is independent
   "pluginMetrics", // DEAD? (production): write path not yet wired (self-documented)
   "prompts", // DEAD? (production): zero production callers; integration test only verifies interface shape
@@ -122,15 +126,21 @@ test("INTENTIONALLY_INTERNAL is exported from check-db-rules.mjs", () => {
   assert.ok(INTENTIONALLY_INTERNAL.size > 0, "INTENTIONALLY_INTERNAL must not be empty");
 });
 
-test("INTENTIONALLY_INTERNAL contains the expected 25 audited modules", () => {
+test("INTENTIONALLY_INTERNAL contains the expected 40 audited modules", () => {
   const expected = [
     "_rowTypes",
+    "accessTokens",
+    "apiKeyColumnFallbacks",
+    "apiKeyUsageLimitFields",
+    "backupRetention",
+    "caseMapping",
     "cleanup",
     "cliToolState",
     "comboForecast",
     "commandCodeAuth",
     "compression",
-    "compressionScheduler",
+    "compressionDetailNormalizers",
+    "connectionRuntimeState",
     "detailedLogs",
     "discovery",
     "domainState",
@@ -138,17 +148,26 @@ test("INTENTIONALLY_INTERNAL contains the expected 25 audited modules", () => {
     "healthCheck",
     "jsonMigration",
     "migrationRunner",
+    "modelCapabilityOverrides",
     "notion",
     "obsidian",
+    "optimizationSettings",
     "pluginMetrics",
     "prompts",
+    "probeUtils",
+    "providerNodeSelect",
     "providerStats",
+    "proxyLatency",
+    "proxySubscriptions",
     "recovery",
+    "schemaColumns",
     "secrets",
     "serviceModels",
     "stateReset",
     "stats",
     "tierConfig",
+    "vacuumScheduler",
+    "webSessionDedup",
   ];
   for (const mod of expected) {
     assert.ok(

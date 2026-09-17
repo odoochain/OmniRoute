@@ -21,7 +21,7 @@ async function resetStorage() {
   for (let attempt = 0; attempt < 10; attempt++) {
     try {
       if (fs.existsSync(TEST_DATA_DIR)) {
-        fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+        fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       }
       break;
     } catch (error: any) {
@@ -43,7 +43,7 @@ test.beforeEach(async () => {
 
 test.after(async () => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 
   if (ORIGINAL_INITIAL_PASSWORD === undefined) {
     delete process.env.INITIAL_PASSWORD;
@@ -66,6 +66,7 @@ test("getSettings exposes defaults and updateSettings persists typed values", as
   assert.equal(defaults.cloudEnabled, true);
   assert.equal(defaults.requireLogin, true);
   assert.deepEqual(defaults.hiddenSidebarItems, []);
+  assert.deepEqual(defaults.hiddenSidebarGroupLabels, []);
   assert.equal(defaults.idempotencyWindowMs, 5000);
   assert.equal(defaults.requestRetry, 3);
   assert.equal(defaults.maxRetryIntervalSec, 30);
@@ -231,6 +232,22 @@ test("LKGP overwrites connectionId when updated without one", async () => {
 
   const record = await settingsDb.getLKGP("combo-e", "model-e");
   assert.deepEqual(record, { provider: "openai" });
+});
+
+test("clearLKGP deletes only the targeted combo/model key", async () => {
+  await settingsDb.setLKGP("combo-f", "model-f", "openai");
+  await settingsDb.setLKGP("combo-f", "model-g", "anthropic");
+
+  await settingsDb.clearLKGP("combo-f", "model-f");
+
+  assert.equal(await settingsDb.getLKGP("combo-f", "model-f"), null);
+  // A sibling key under the same combo must survive.
+  assert.deepEqual(await settingsDb.getLKGP("combo-f", "model-g"), { provider: "anthropic" });
+});
+
+test("clearLKGP on a key with no existing pin does not throw", async () => {
+  await assert.doesNotReject(() => settingsDb.clearLKGP("combo-never-set", "model-never-set"));
+  assert.equal(await settingsDb.getLKGP("combo-never-set", "model-never-set"), null);
 });
 
 test("pricing helpers ignore malformed synced data and LKGP falls back to raw values", async () => {
@@ -599,7 +616,8 @@ test("proxy resolution matches combo proxies through aliased model entries", asy
     apiKey: "sk-claude-alias",
   });
   // Enable proxy on this connection so legacy combo/provider proxy checks work
-  core.getDbInstance()
+  core
+    .getDbInstance()
     .prepare("UPDATE provider_connections SET proxy_enabled = 1 WHERE id = ?")
     .run((connection as any).id);
 
@@ -644,10 +662,12 @@ test("proxy resolution prefers legacy key and provider proxies over registry glo
   await proxiesDb.assignProxyToScope("global", null, registryGlobal.id);
 
   // Enable proxy on both connections so legacy key/provider proxy checks work
-  core.getDbInstance()
+  core
+    .getDbInstance()
     .prepare("UPDATE provider_connections SET proxy_enabled = 1 WHERE id = ?")
     .run((keyConnection as any).id);
-  core.getDbInstance()
+  core
+    .getDbInstance()
     .prepare("UPDATE provider_connections SET proxy_enabled = 1 WHERE id = ?")
     .run((providerConnection as any).id);
 

@@ -2,6 +2,8 @@
 import React, { act } from "react";
 import { createRoot } from "react-dom/client";
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
+import { NextIntlClientProvider } from "next-intl";
+import messages from "../../../src/i18n/messages/en.json";
 import type { CompressionRunModel } from "@/app/(dashboard)/dashboard/compression/studio/compressionFlowModel";
 
 // ── Polyfill ResizeObserver (required by ReactFlow) ───────────────────────
@@ -41,9 +43,22 @@ function mount(ui: React.ReactElement): HTMLElement {
   containers.push(container);
   const root = createRoot(container);
   act(() => {
-    root.render(ui);
+    root.render(
+      <NextIntlClientProvider
+        locale="en"
+        messages={{ compressionStudio: messages.compressionStudio }}
+      >
+        {ui}
+      </NextIntlClientProvider>
+    );
   });
   return container;
+}
+
+function click(el: Element | null): void {
+  act(() => {
+    el?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
 }
 
 beforeEach(() => {
@@ -145,5 +160,31 @@ describe("CompressionCockpit", () => {
     // Replay button present
     const text = container.textContent ?? "";
     expect(text).toContain("Replay");
+  });
+
+  it("offers a Canvas/Waterfall view toggle", () => {
+    const container = mount(<CompressionCockpit run={SAMPLE_RUN} />);
+    expect(container.querySelector("[data-testid='cockpit-view-canvas']")).toBeTruthy();
+    expect(container.querySelector("[data-testid='cockpit-view-waterfall']")).toBeTruthy();
+  });
+
+  it("switches to the waterfall inspector and back to the canvas", () => {
+    const container = mount(<CompressionCockpit run={SAMPLE_RUN} />);
+    // Default view is the ReactFlow canvas, waterfall hidden.
+    expect(container.querySelector(".react-flow")).toBeTruthy();
+    expect(container.querySelector("[data-testid='waterfall-inspector']")).toBeFalsy();
+
+    // Switch to the waterfall (A1) view — the previously-orphan component is now reachable.
+    click(container.querySelector("[data-testid='cockpit-view-waterfall']"));
+    expect(container.querySelector("[data-testid='waterfall-inspector']")).toBeTruthy();
+    expect(container.querySelector(".react-flow")).toBeFalsy();
+    expect(
+      container.querySelector("[data-testid='waterfall-total-savings']")?.textContent
+    ).toContain("51.2");
+
+    // Switch back to the canvas.
+    click(container.querySelector("[data-testid='cockpit-view-canvas']"));
+    expect(container.querySelector(".react-flow")).toBeTruthy();
+    expect(container.querySelector("[data-testid='waterfall-inspector']")).toBeFalsy();
   });
 });

@@ -1,14 +1,23 @@
 /**
  * Thinking Budget Control — Phase 2
  *
- * Provides proxy-level control over AI thinking/reasoning budgets.
- * Modes: auto, passthrough, custom, adaptive
+ * Proxy-level control of **client thinking/reasoning request fields**
+ * (`reasoning`, `reasoning_effort`, Claude `thinking`, Gemini thinking_config).
+ *
+ * Modes (see Dashboard → Settings → AI → Thinking Budget):
+ * - passthrough: leave client fields unchanged (required for Codex visible thinking)
+ * - auto: STRIP all thinking/reasoning fields before upstream (not “auto-show thinking”)
+ * - custom: force a fixed token budget on every request
+ * - adaptive: scale budget from a base effort by request complexity
+ *
+ * Independent of compression, prompt cache, combo routing, and API-key token limits.
+ * Does **not** decrypt OpenAI/Codex `encrypted_content` reasoning blobs.
  */
 
 // Thinking budget modes
 export const ThinkingMode = {
-  AUTO: "auto", // Let provider decide (remove client's budget)
-  PASSTHROUGH: "passthrough", // No changes (current behavior)
+  AUTO: "auto", // Strip all client thinking/reasoning fields (provider invents defaults)
+  PASSTHROUGH: "passthrough", // No changes — client fully controls thinking
   CUSTOM: "custom", // Set fixed budget
   ADAPTIVE: "adaptive", // Scale based on request complexity
 };
@@ -56,8 +65,24 @@ export const DEFAULT_THINKING_CONFIG = {
   effortLevel: "medium",
 } satisfies ThinkingBudgetConfig;
 
-// In-memory config (loaded from DB on startup, or default)
-let _config: ThinkingBudgetConfig = { ...DEFAULT_THINKING_CONFIG };
+// In-memory config (loaded from DB on startup, or default).
+//
+// Backed by globalThis so the singleton is shared across the SEPARATE webpack
+// module graphs Next.js builds for `instrumentation.ts` (boot-time hydration via
+// hydrateThinkingBudgetConfig) and the app-route / open-sse executors (per-request
+// reads in base.ts). A plain module-level `let` is DUPLICATED per graph, so the
+// boot hydration would land on the instrumentation graph's copy and never reach
+// base.ts — exactly the #5312 fix-A break proven on the VPS. Mirrors the same
+// globalThis pattern systemPrompt.ts already uses for the Global System Prompt (#2470).
+const GLOBAL_KEY = "__omniroute_thinkingBudget_config__";
+const _store = globalThis as unknown as Record<string, ThinkingBudgetConfig | undefined>;
+
+function getConfig(): ThinkingBudgetConfig {
+  if (!_store[GLOBAL_KEY]) {
+    _store[GLOBAL_KEY] = { ...DEFAULT_THINKING_CONFIG };
+  }
+  return _store[GLOBAL_KEY]!;
+}
 
 function toRecord(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
@@ -72,14 +97,31 @@ function getStringField(record: JsonRecord, key: string): string {
  * Set the thinking budget config (called from settings API or startup)
  */
 export function setThinkingBudgetConfig(config: Partial<ThinkingBudgetConfig>) {
-  _config = { ...DEFAULT_THINKING_CONFIG, ...config };
+  _store[GLOBAL_KEY] = { ...DEFAULT_THINKING_CONFIG, ...config };
 }
 
 /**
  * Get current thinking budget config
  */
 export function getThinkingBudgetConfig() {
-  return { ..._config };
+  return { ...getConfig() };
+}
+
+/**
+ * Startup hydration (#5312 RC-A): the dashboard Thinking-Budget setting is persisted
+ * under `settings.thinkingBudget`, but nothing read it back at boot, so `_config`
+ * reset to DEFAULT (passthrough) on every restart. Call this once during server
+ * bootstrap with the loaded settings object to restore the operator's choice.
+ * Returns true when a valid config was applied, false otherwise (zero behavior
+ * change when the setting is unset).
+ */
+export function hydrateThinkingBudgetConfig(settings: unknown): boolean {
+  const tb = toRecord(settings).thinkingBudget;
+  if (tb && typeof tb === "object" && !Array.isArray(tb)) {
+    setThinkingBudgetConfig(tb as Partial<ThinkingBudgetConfig>);
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -178,7 +220,7 @@ export function applyThinkingBudget(
   body: unknown,
   config: Partial<ThinkingBudgetConfig> | null = null
 ) {
-  const cfg = config || _config;
+  const cfg = config || getConfig();
   if (!body || typeof body !== "object") return body;
 
   // Early exit: strip ALL reasoning/thinking params for models that don't support them.
@@ -214,7 +256,9 @@ export function applyThinkingBudget(
 }
 
 /**
- * AUTO mode: strip all thinking configuration, let provider decide
+ * AUTO mode: strip all thinking/reasoning configuration from the request body.
+ * Upstream then runs without client-requested effort/summary — this can hide
+ * thinking panels in Codex/Desktop and is the opposite of “show thinking”.
  */
 function stripThinkingConfig(body: unknown) {
   const result: JsonRecord = { ...toRecord(body) };

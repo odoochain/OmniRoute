@@ -30,8 +30,8 @@ import { getProviderDisplayLabel } from "@/shared/utils/providerDisplayLabel";
 import useEmailPrivacyStore from "@/store/emailPrivacyStore";
 import {
   computeLogsSignature,
-  resolveInitialVisibility,
   shouldAutoRefresh,
+  shouldTriggerInfiniteScroll,
 } from "./requestLoggerSignature";
 import {
   DEFAULT_REFRESH_INTERVAL_SEC,
@@ -39,6 +39,14 @@ import {
   readSavedRefreshIntervalSec,
   writeSavedRefreshIntervalSec,
 } from "./requestLoggerPreferences";
+import {
+  LOG_TABLE_CLASS,
+  LOG_TABLE_HEAD_CLASS,
+  LOG_TABLE_HEADER_BG_STYLE,
+  LOG_TABLE_HEADER_CELL_CLASS,
+  LOG_TABLE_HEADER_CELL_RIGHT_CLASS,
+  LOG_TABLE_ROW_CLASS,
+} from "./logTableStyles";
 
 // Number of call-log rows fetched per page. The viewer grows its window by this
 // amount on "Load more" / infinite scroll so users can browse past the first
@@ -87,6 +95,7 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
   (props, ref) => {
     const { initialSelectedId } = props as any;
     const t = useTranslations("requestLogger");
+    const tCache = useTranslations("cache");
     const { emailsVisible } = useEmailPrivacyStore();
 
     // Get translated status filters
@@ -116,6 +125,7 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
         { key: "tps", label: t("columns.tps") },
         { key: "duration", label: t("columns.duration") },
         { key: "time", label: t("columns.time") },
+        { key: "conversation", label: t("columns.conversation") },
       ],
       [t]
     );
@@ -131,7 +141,38 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
     const [selectedApiKey, setSelectedApiKey] = useState("");
     const [sortBy, setSortBy] = useState("newest");
     const [selectedLog, setSelectedLog] = useState(null);
+    const [correlationIdFilter, setCorrelationIdFilter] = useState("");
+    const [hoveredCid, setHoveredCid] = useState<string | null>(null);
+    const [groupedView, setGroupedView] = useState(false);
     const [detailLoading, setDetailLoading] = useState(false);
+
+    // Column sort toggle: clicking a column header toggles asc/desc
+    const columnSortMap = {
+      status: { desc: "status_desc", asc: "status_asc" },
+      model: { desc: "model_desc", asc: "model_asc" },
+      tokens: { desc: "tokens_desc", asc: "tokens_asc" },
+      tps: { desc: "tps_desc", asc: "tps_asc" },
+      duration: { desc: "duration_desc", asc: "duration_asc" },
+      time: { desc: "newest", asc: "oldest" },
+    };
+    const toggleSort = useCallback((column: string) => {
+      const mapping = columnSortMap[column as keyof typeof columnSortMap];
+      if (!mapping) return;
+      setSortBy((prev) => {
+        if (prev === mapping.desc) return mapping.asc;
+        return mapping.desc;
+      });
+    }, []);
+    const getSortIndicator = useCallback(
+      (column: string) => {
+        const mapping = columnSortMap[column as keyof typeof columnSortMap];
+        if (!mapping) return "";
+        if (sortBy === mapping.desc) return " ↓";
+        if (sortBy === mapping.asc) return " ↑";
+        return "";
+      },
+      [sortBy]
+    );
     const [detailData, setDetailData] = useState(null);
     const [detailLoggingEnabled, setDetailLoggingEnabled] = useState(false);
     const [detailLoggingLoading, setDetailLoggingLoading] = useState(false);
@@ -140,14 +181,21 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
     const [refreshIntervalSec, setRefreshIntervalSec] = useState(DEFAULT_REFRESH_INTERVAL_SEC);
     const intervalRef = useRef(null);
     const refreshIntervalSecRef = useRef(DEFAULT_REFRESH_INTERVAL_SEC);
+    const detailRequestRef = useRef("");
     const hasLoadedRef = useRef(false);
     const logsSignatureRef = useRef("");
     const scrollContainerRef = useRef(null);
     const loadMoreSentinelRef = useRef(null);
+    const hasScrolledRef = useRef(false);
     const [providerNodes, setProviderNodes] = useState([]);
-    const visibleRef = useRef(resolveInitialVisibility());
+    const visibleRef = useRef(true);
+    // Set when handlePrev/handleNext hits the edge of the (possibly stale —
+    // list polling pauses while a detail modal is open) in-memory list, so we
+    // can tell a genuine "no more items" from "more items landed in the
+    // background while the modal was open and we just haven't fetched them
+    // yet" before giving up and closing the modal.
+    const pendingBoundaryNavRef = useRef<null | "prev" | "next">(null);
 
-    // Column visibility with localStorage persistence
     const [visibleColumns, setVisibleColumns] = useState(() => {
       const defaultVisible = Object.fromEntries(columns.map((c) => [c.key, true]));
       if (globalThis.window === undefined) return defaultVisible;
@@ -205,6 +253,7 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
           if (selectedProvider) params.set("provider", selectedProvider);
           if (selectedAccount) params.set("account", selectedAccount);
           if (selectedApiKey) params.set("apiKey", selectedApiKey);
+          if (correlationIdFilter) params.set("correlationId", correlationIdFilter);
           params.set("limit", String(limit));
 
           const res = await fetch(`/api/usage/call-logs?${params}`);
@@ -234,6 +283,7 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
         selectedAccount,
         selectedProvider,
         selectedApiKey,
+        correlationIdFilter,
         limit,
       ]
     );
@@ -275,15 +325,41 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
           fetchLogs(false);
         }
       };
+      // #4133: re-arm on window focus. Embedded / proxied hosts (Docker dashboard
+      // wrappers, webviews) can fire a one-shot `visibilitychange` → hidden and
+      // then keep reporting "hidden" — or recover without firing the event again —
+      // which left `visibleRef` stuck `false` and froze auto-refresh permanently
+      // (the "still not refreshing on 3.8.28, works on 3.8.24" report). A window
+      // `focus` is a reliable signal the page is actively viewed, so re-arm and
+      // poll. A genuinely backgrounded tab never receives focus, so this does not
+      // defeat the perf pause.
+      const onFocus = () => {
+        visibleRef.current = true;
+        if (!selectedLog && shouldAutoRefresh(recording, limit, PAGE_SIZE)) {
+          fetchLogs(false);
+        }
+      };
       document.addEventListener("visibilitychange", onVisibility);
-      return () => document.removeEventListener("visibilitychange", onVisibility);
+      window.addEventListener("focus", onFocus);
+      return () => {
+        document.removeEventListener("visibilitychange", onVisibility);
+        window.removeEventListener("focus", onFocus);
+      };
     }, [recording, limit, fetchLogs, selectedLog]);
 
     useEffect(() => {
       if (intervalRef.current) clearInterval(intervalRef.current);
       if (!selectedLog && shouldAutoRefresh(recording, limit, PAGE_SIZE)) {
         intervalRef.current = setInterval(() => {
-          if (visibleRef.current) fetchLogs(false);
+          // #3972/#4054/#4133: poll while the page is plausibly viewed — the
+          // event-tracked `visibleRef` (fail-open) OR a *live* `visibilityState`
+          // read. A real background tab has both false → pause (perf); an
+          // embedded host that misreports "hidden" keeps polling instead of
+          // freezing. The window-`focus` re-arm above covers a host pinned
+          // "hidden" while focused.
+          if (visibleRef.current || document.visibilityState === "visible") {
+            fetchLogs(false);
+          }
         }, refreshIntervalSec * 1000);
       }
       return () => {
@@ -295,21 +371,55 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
     // so switching filters doesn't keep fetching a large expanded window.
     useEffect(() => {
       setLimit(PAGE_SIZE);
-    }, [search, activeFilter, selectedModel, selectedAccount, selectedProvider, selectedApiKey]);
+      // #4269: a filter change is a fresh first-page view — re-arm the ghost-load-more
+      // guard so auto-refresh resumes until the user scrolls again.
+      hasScrolledRef.current = false;
+    }, [
+      search,
+      activeFilter,
+      selectedModel,
+      selectedAccount,
+      selectedProvider,
+      selectedApiKey,
+      correlationIdFilter,
+    ]);
 
     const loadMore = useCallback(() => {
       setLimit((prev) => prev + PAGE_SIZE);
     }, []);
 
+    // #4269: record the first genuine user scroll of the log list. Until then, the
+    // infinite-scroll observer below must NOT grow the window (see
+    // shouldTriggerInfiniteScroll) — otherwise a sentinel that is already visible on
+    // mount fires a "ghost" loadMore and permanently pauses auto-refresh.
+    useEffect(() => {
+      const root = scrollContainerRef.current;
+      if (!root) return;
+      const onScroll = () => {
+        if (root.scrollTop > 0) hasScrolledRef.current = true;
+      };
+      root.addEventListener("scroll", onScroll, { passive: true });
+      return () => root.removeEventListener("scroll", onScroll);
+    }, []);
+
     // Infinite scroll: grow the window when the sentinel near the bottom of the
-    // scroll container becomes visible.
+    // scroll container becomes visible — but only after a real user scroll (#4269).
     useEffect(() => {
       const sentinel = loadMoreSentinelRef.current;
       const root = scrollContainerRef.current;
       if (!sentinel || !hasMore) return;
       const observer = new IntersectionObserver(
         (entries) => {
-          if (entries[0]?.isIntersecting && !loading) loadMore();
+          if (
+            shouldTriggerInfiniteScroll({
+              isIntersecting: !!entries[0]?.isIntersecting,
+              hasMore,
+              loading,
+              hasScrolled: hasScrolledRef.current,
+            })
+          ) {
+            loadMore();
+          }
         },
         { root, rootMargin: "200px" }
       );
@@ -332,8 +442,31 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
       return arr;
     }, [logs, activeFilter]);
 
+    // Grouped view: deduplicate by correlationId, keeping only the latest per group.
+    // Rows without a correlationId are always shown.
+    const dedupedLogs = useMemo(() => {
+      if (!groupedView) return filteredLogs;
+      const byCid = new Map<string, (typeof filteredLogs)[0]>();
+      const noCid: typeof filteredLogs = [];
+      for (const log of filteredLogs) {
+        const cid = log.correlationId;
+        if (!cid) {
+          noCid.push(log);
+          continue;
+        }
+        const existing = byCid.get(cid);
+        if (
+          !existing ||
+          new Date(log.timestamp).getTime() > new Date(existing.timestamp).getTime()
+        ) {
+          byCid.set(cid, log);
+        }
+      }
+      return [...noCid, ...byCid.values()];
+    }, [filteredLogs, groupedView]);
+
     const sortedLogs = useMemo(() => {
-      const arr = [...filteredLogs];
+      const arr = [...dedupedLogs];
 
       arr.sort((a, b) => {
         switch (sortBy) {
@@ -366,7 +499,35 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
       });
 
       return arr;
-    }, [filteredLogs, sortBy]);
+    }, [dedupedLogs, sortBy]);
+
+    // Group by correlationId: mark retries as children so they render indented
+    // under the first request in each group. Compute group health:
+    //   "healed"  — at least one failure followed by a success
+    //   "failed"  — all attempts failed
+    //   null      — single request or all succeeded
+    const groupedLogs = useMemo(() => {
+      const cidGroups = new Map();
+      for (const log of sortedLogs) {
+        const cid = log.correlationId;
+        if (cid) {
+          if (!cidGroups.has(cid)) cidGroups.set(cid, []);
+          cidGroups.get(cid).push(log);
+        }
+      }
+      return sortedLogs.map((log) => {
+        const cid = log.correlationId;
+        if (!cid) return { ...log, isRetry: false, groupSize: 1, groupStatus: null };
+        const group = cidGroups.get(cid);
+        if (!group || group.length <= 1)
+          return { ...log, isRetry: false, groupSize: 1, groupStatus: null };
+        const isFirst = group[0].id === log.id;
+        const hasFailure = group.some((g) => g.status >= 400 || g.active);
+        const hasSuccess = group.some((g) => g.status >= 200 && g.status < 300);
+        const groupStatus = hasFailure && hasSuccess ? "healed" : hasFailure ? "failed" : null;
+        return { ...log, isRetry: !isFirst, groupSize: group.length, groupStatus };
+      });
+    }, [sortedLogs]);
 
     // Fetch log detail from the persisted call-log endpoint. If a deep-linked
     // request is still being finalized, keep the modal open and poll this same
@@ -382,11 +543,15 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
         return;
       }
 
+      const requestToken = `${logEntry.id}:${Date.now()}:${Math.random()}`;
+      detailRequestRef.current = requestToken;
+      const isCurrentDetailRequest = () => detailRequestRef.current === requestToken;
+
       setSelectedLog(logEntry);
       try {
         const url = new URL(globalThis.location.href);
         url.searchParams.set("id", logEntry.id);
-        router.replace(url.pathname + url.search);
+        router.replace(url.pathname + url.search, { scroll: false });
       } catch (e) {
         // ignore navigation errors
       }
@@ -396,6 +561,7 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
         const res = await fetch(`/api/logs/${logEntry.id}`, { cache: "no-store" });
         if (res.ok) {
           const data = await res.json();
+          if (!isCurrentDetailRequest()) return;
           const dataHasPipeline =
             data?.pipelinePayloads && Object.keys(data.pipelinePayloads || {}).length > 0;
           setDetailData((prev: { pipelinePayloads: any }) => ({
@@ -415,6 +581,7 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
           // A deep-linked id can legitimately 404 while the request is still
           // finalizing. Keep the modal open and poll /api/logs/[id] instead of
           // falling back to an in-memory active-request endpoint.
+          if (!isCurrentDetailRequest()) return;
           if (res.status === 404) {
             if (logEntry.pendingLookup || logEntry.active) {
               setSelectedLog((prev: { method: any; path: any }) => ({
@@ -438,24 +605,26 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
           // other errors: show a minimal error indicator by setting detailData to an error object
           try {
             const body = await res.text().catch(() => null);
+            if (!isCurrentDetailRequest()) return;
             setDetailData({ error: `Failed to fetch log (status ${res.status})`, body });
           } catch {}
         }
       } catch (error) {
         console.error("Failed to fetch log detail:", error);
       } finally {
-        setDetailLoading(false);
+        if (isCurrentDetailRequest()) setDetailLoading(false);
       }
     };
 
     const closeDetail = () => {
+      detailRequestRef.current = "";
       setSelectedLog(null);
       setDetailData(null);
       try {
         // remove id param when closing detail
         const url = new URL(globalThis.location.href);
         url.searchParams.delete("id");
-        router.replace(url.pathname + url.search);
+        router.replace(url.pathname + url.search, { scroll: false });
       } catch (e) {
         // ignore navigation errors
       }
@@ -529,6 +698,50 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
       };
     }, [selectedLog?.id, detailData?.detailState, selectedLog?.active, fetchLogs]);
 
+    // Poll for related logs (same correlationId) while the detail modal is open.
+    // This ensures newly completed retries appear without closing the modal.
+    useEffect(() => {
+      const cid = selectedLog?.correlationId;
+      if (!selectedLog?.id || !cid) return;
+      let cancelled = false;
+      const interval = setInterval(async () => {
+        if (document.visibilityState !== "visible") return;
+        try {
+          const res = await fetch(`/api/usage/call-logs?correlationId=${encodeURIComponent(cid)}`, {
+            cache: "no-store",
+          });
+          if (cancelled || !res.ok) return;
+          const cidLogs = await res.json();
+          if (!Array.isArray(cidLogs) || cidLogs.length === 0) return;
+          setLogs((prev) => {
+            const ids = new Set(cidLogs.map((l: any) => l.id));
+            let changed = false;
+            const merged = prev.map((l: any) => {
+              const updated = cidLogs.find((c: any) => c.id === l.id);
+              if (updated) {
+                changed = true;
+                return { ...l, ...updated };
+              }
+              return l;
+            });
+            for (const cl of cidLogs) {
+              if (!merged.some((m: any) => m.id === cl.id)) {
+                merged.push(cl);
+                changed = true;
+              }
+            }
+            return changed ? merged : prev;
+          });
+        } catch {
+          /* poll failed — non-critical */
+        }
+      }, 3000);
+      return () => {
+        cancelled = true;
+        clearInterval(interval);
+      };
+    }, [selectedLog?.id, selectedLog?.correlationId]);
+
     const currentLogIndex = useMemo(() => {
       if (!selectedLog) return -1;
       return sortedLogsForNav.findIndex((l) => l.id === selectedLog.id);
@@ -544,9 +757,14 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
             console.error("Failed to open previous log id:", error_);
           });
       } else {
-        closeDetail();
+        // List polling pauses while the modal is open (#background list can
+        // go stale), so hitting the edge of the in-memory array doesn't mean
+        // there's really nothing newer — resync once and let the effect below
+        // decide, instead of assuming this is the last item and closing.
+        pendingBoundaryNavRef.current = "prev";
+        fetchLogs(false);
       }
-    }, [currentLogIndex, sortedLogsForNav]);
+    }, [currentLogIndex, sortedLogsForNav, fetchLogs]);
 
     const handleNext = useCallback(() => {
       const idx = currentLogIndex;
@@ -559,9 +777,43 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
             console.error("Failed to open previous log id:", error_);
           });
       } else {
+        pendingBoundaryNavRef.current = "next";
+        fetchLogs(false);
+      }
+    }, [currentLogIndex, sortedLogsForNav, fetchLogs]);
+
+    // Resolves a pending boundary nav (see handlePrev/handleNext) once a
+    // triggered fetchLogs() resync has landed in sortedLogsForNav. Only fires
+    // when a boundary nav is actually pending, so this is a no-op on the
+    // normal (paused-while-modal-open) list-update cadence.
+    useEffect(() => {
+      const direction = pendingBoundaryNavRef.current;
+      if (!direction || !selectedLog) return;
+      pendingBoundaryNavRef.current = null;
+      const idx = sortedLogsForNav.findIndex((l) => l.id === selectedLog.id);
+      const target =
+        direction === "prev"
+          ? idx > 0
+            ? sortedLogsForNav[idx - 1]
+            : null
+          : idx >= 0 && idx < sortedLogsForNav.length - 1
+            ? sortedLogsForNav[idx + 1]
+            : null;
+      if (target?.id) {
+        openDetail(target)
+          .then((r) => r)
+          .catch((error_) => {
+            console.error("Failed to open adjacent log id:", error_);
+          });
+      } else {
         closeDetail();
       }
-    }, [currentLogIndex, sortedLogsForNav]);
+      // openDetail/closeDetail are plain functions re-created every render
+      // (same as handlePrev/handleNext above and the rest of this file) —
+      // listing them would re-fire this effect on every render instead of
+      // only when sortedLogsForNav/selectedLog actually change.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [sortedLogsForNav, selectedLog]);
 
     const toggleDetailLogging = async () => {
       setDetailLoggingLoading(true);
@@ -616,13 +868,14 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
     );
 
     // Stats (memoized to avoid re-computation on every render)
-    const { totalCount, okCount, errorCount, comboCount, apiKeyCount } = useMemo(
+    const { totalCount, okCount, errorCount, comboCount, apiKeyCount, runningCount } = useMemo(
       () => ({
         totalCount: filteredLogs.length,
         okCount: filteredLogs.filter((l) => l.status >= 200 && l.status < 300).length,
         errorCount: filteredLogs.filter((l) => l.status >= 400).length,
         comboCount: logs.filter((l) => l.comboName).length,
         apiKeyCount: uniqueApiKeys.length,
+        runningCount: filteredLogs.filter((l) => l.active === true).length,
       }),
       [filteredLogs, logs, uniqueApiKeys]
     );
@@ -679,6 +932,36 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
               className="w-full pl-10 pr-4 py-2 rounded-lg bg-bg-subtle border border-border text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:border-primary"
             />
           </div>
+
+          {/* Correlation ID Filter */}
+          <div className="min-w-[180px] relative">
+            <span className="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-text-muted text-[16px]">
+              tag
+            </span>
+            <input
+              type="text"
+              placeholder={t("correlationId")}
+              value={correlationIdFilter}
+              onChange={(e) => setCorrelationIdFilter(e.target.value)}
+              className="w-full pl-9 pr-3 py-2 rounded-lg bg-bg-subtle border border-border text-sm text-text-primary font-mono placeholder:text-text-muted focus:outline-none focus:border-primary"
+            />
+          </div>
+
+          {/* Group by CID toggle */}
+          <button
+            onClick={() => setGroupedView((v) => !v)}
+            className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium border transition-colors ${
+              groupedView
+                ? "bg-violet-500/15 border-violet-500/30 text-violet-700 dark:text-violet-300"
+                : "bg-bg-subtle border-border text-text-muted hover:text-text-primary"
+            }`}
+            title={groupedView ? t("group.showAllRows") : t("group.showLatestPerCorrelation")}
+          >
+            <span className="material-symbols-outlined text-[16px]">
+              {groupedView ? "unfold_less" : "unfold_more"}
+            </span>
+            {groupedView ? t("group.grouped") : t("statusFilters.all")}
+          </button>
 
           {/* Provider Dropdown */}
           <select
@@ -749,6 +1032,11 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
             <span className="px-2 py-1 rounded bg-bg-subtle border border-border font-mono">
               {totalCount} {t("total")}
             </span>
+            {runningCount > 0 && (
+              <span className="px-2 py-1 rounded bg-amber-500/10 text-amber-700 dark:text-amber-400 font-mono">
+                {runningCount} {t("running")}
+              </span>
+            )}
             <span className="px-2 py-1 rounded bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 font-mono">
               {okCount} {t("ok")}
             </span>
@@ -796,7 +1084,7 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
             <button
               onClick={() => updateRefreshIntervalSec((v) => v - 1)}
               className="w-6 h-6 flex items-center justify-center rounded hover:bg-bg-subtle text-text-muted hover:text-text-primary transition-colors text-sm font-bold"
-              title="Decrease interval"
+              title={t("interval.decrease")}
             >
               −
             </button>
@@ -810,12 +1098,12 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
                 if (!Number.isNaN(v)) updateRefreshIntervalSec(v);
               }}
               className="w-12 text-center text-[11px] bg-transparent border border-border rounded px-1 py-0.5 text-text-primary [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-              title="Auto-refresh interval in seconds"
+              title={t("interval.title")}
             />
             <button
               onClick={() => updateRefreshIntervalSec((v) => v + 1)}
               className="w-6 h-6 flex items-center justify-center rounded hover:bg-bg-subtle text-text-muted hover:text-text-primary transition-colors text-sm font-bold"
-              title="Increase interval"
+              title={t("interval.increase")}
             >
               +
             </button>
@@ -910,10 +1198,7 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
         </div>
 
         {/* Table */}
-        <Card
-          padding="none"
-          className="min-h-[460px] resize-y overflow-auto bg-black/5 dark:bg-black/20"
-        >
+        <Card padding="none" className="min-h-[460px] resize-y overflow-auto bg-surface">
           <div
             ref={scrollContainerRef}
             className="p-0 overflow-x-auto overflow-y-auto h-full min-h-[460px]"
@@ -930,84 +1215,85 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
             ) : sortedLogs.length === 0 ? (
               <div className="p-8 text-center text-text-muted">{t("noMatchingLogs")}</div>
             ) : (
-              <table className="w-full text-left border-collapse text-xs">
-                <thead
-                  className="sticky top-0 z-10"
-                  style={{ backgroundColor: "var(--color-bg, #fff)" }}
-                >
-                  <tr
-                    className="border-b border-border"
-                    style={{ backgroundColor: "var(--color-bg, #fff)" }}
-                  >
+              <table className={LOG_TABLE_CLASS}>
+                <thead className={LOG_TABLE_HEAD_CLASS} style={LOG_TABLE_HEADER_BG_STYLE}>
+                  <tr className={LOG_TABLE_ROW_CLASS} style={LOG_TABLE_HEADER_BG_STYLE}>
                     {visibleColumns.status && (
-                      <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
+                      <th
+                        className={`${LOG_TABLE_HEADER_CELL_CLASS} cursor-pointer select-none`}
+                        onClick={() => toggleSort("status")}
+                      >
                         {t("columns.status")}
+                        {getSortIndicator("status")}
                       </th>
                     )}
                     {visibleColumns.cacheSource && (
-                      <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                        {t("columns.cacheSource")}
-                      </th>
+                      <th className={LOG_TABLE_HEADER_CELL_CLASS}>{t("columns.cacheSource")}</th>
                     )}
                     {visibleColumns.model && (
-                      <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                        {t("columns.model")}
-                      </th>
+                      <th className={LOG_TABLE_HEADER_CELL_CLASS}>{t("columns.model")}</th>
                     )}
                     {visibleColumns.requestedModel && (
-                      <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                        {t("columns.requested")}
-                      </th>
+                      <th className={LOG_TABLE_HEADER_CELL_CLASS}>{t("columns.requested")}</th>
                     )}
                     {visibleColumns.provider && (
-                      <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                        {t("columns.provider")}
-                      </th>
+                      <th className={LOG_TABLE_HEADER_CELL_CLASS}>{t("columns.provider")}</th>
                     )}
                     {visibleColumns.protocol && (
-                      <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                        {t("columns.protocol")}
-                      </th>
+                      <th className={LOG_TABLE_HEADER_CELL_CLASS}>{t("columns.protocol")}</th>
                     )}
                     {visibleColumns.account && (
-                      <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                        {t("columns.account")}
-                      </th>
+                      <th className={LOG_TABLE_HEADER_CELL_CLASS}>{t("columns.account")}</th>
                     )}
                     {visibleColumns.apiKey && (
-                      <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                        {t("columns.apiKey")}
-                      </th>
+                      <th className={LOG_TABLE_HEADER_CELL_CLASS}>{t("columns.apiKey")}</th>
                     )}
                     {visibleColumns.combo && (
-                      <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px]">
-                        {t("columns.combo")}
-                      </th>
+                      <th className={LOG_TABLE_HEADER_CELL_CLASS}>{t("columns.combo")}</th>
                     )}
                     {visibleColumns.tokens && (
-                      <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px] text-right">
+                      <th
+                        className={`${LOG_TABLE_HEADER_CELL_RIGHT_CLASS} cursor-pointer select-none`}
+                        onClick={() => toggleSort("tokens")}
+                      >
                         {t("columns.tokens")}
+                        {getSortIndicator("tokens")}
                       </th>
                     )}
                     {visibleColumns.tps && (
-                      <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px] text-right">
+                      <th
+                        className={`${LOG_TABLE_HEADER_CELL_RIGHT_CLASS} cursor-pointer select-none`}
+                        onClick={() => toggleSort("tps")}
+                      >
                         {t("columns.tps")}
+                        {getSortIndicator("tps")}
                       </th>
                     )}
                     {visibleColumns.duration && (
-                      <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px] text-right">
+                      <th
+                        className={`${LOG_TABLE_HEADER_CELL_RIGHT_CLASS} cursor-pointer select-none`}
+                        onClick={() => toggleSort("duration")}
+                      >
                         {t("columns.duration")}
+                        {getSortIndicator("duration")}
                       </th>
                     )}
                     {visibleColumns.time && (
-                      <th className="px-3 py-2.5 font-semibold text-text-muted uppercase tracking-wider text-[10px] text-right">
+                      <th
+                        className={`${LOG_TABLE_HEADER_CELL_RIGHT_CLASS} cursor-pointer select-none`}
+                        onClick={() => toggleSort("time")}
+                      >
                         {t("columns.time")}
+                        {getSortIndicator("time")}
                       </th>
+                    )}
+                    {visibleColumns.conversation && (
+                      <th className={LOG_TABLE_HEADER_CELL_CLASS}>{t("columns.conversation")}</th>
                     )}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-border/30">
-                  {sortedLogs.map((log) => {
+                  {groupedLogs.map((log) => {
                     const isActive = log.active === true;
                     const statusStyle = isActive ? null : getStatusStyle(log.status);
                     const protocolKey = isActive ? null : log.sourceFormat || log.provider;
@@ -1020,7 +1306,7 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
                       text: "#fff",
                       label: compatLabel || (log.provider || "-").toUpperCase(),
                     };
-                    const providerLabel = compatLabel || providerColor.label;
+                    const providerLabel = log.providerDisplay || compatLabel || providerColor.label;
                     const isError = !isActive && log.status >= 400;
                     const cacheSourceMeta = getCacheSourceMeta(log.cacheSource);
                     const isSemanticCache = cacheSourceMeta?.key === "semantic";
@@ -1030,23 +1316,75 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
                       <tr
                         key={log.id}
                         onClick={() => openDetail(log)}
-                        className={`cursor-pointer hover:bg-sky-500/10 dark:hover:bg-sky-400/10 transition-colors ${isError ? "bg-red-500/5" : ""}`}
+                        data-cid={log.correlationId || undefined}
+                        onMouseEnter={() => log.correlationId && setHoveredCid(log.correlationId)}
+                        onMouseLeave={() => setHoveredCid(null)}
+                        className={
+                          `cursor-pointer transition-colors ` +
+                          `${
+                            isError
+                              ? "bg-red-500/5 hover:bg-red-500/15 dark:hover:bg-red-400/15"
+                              : "hover:bg-sky-500/10 dark:hover:bg-sky-400/10"
+                          } ` +
+                          `${log.isRetry ? "border-l-2 border-l-amber-500/50" : ""} ` +
+                          `${hoveredCid && log.correlationId === hoveredCid ? "bg-violet-500/10 dark:bg-violet-400/10 ring-1 ring-violet-500/20" : ""}`
+                        }
+                        style={
+                          log.isRetry
+                            ? {
+                                backgroundColor:
+                                  hoveredCid && log.correlationId === hoveredCid
+                                    ? undefined
+                                    : "rgba(245,158,11,0.03)",
+                              }
+                            : undefined
+                        }
                       >
                         {visibleColumns.status && (
                           <td className="px-3 py-2">
                             {isActive ? (
                               <span
                                 className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-amber-500/15 border border-amber-500/25"
-                                title="In progress"
+                                title={t("status.inProgress")}
                               >
                                 <span className="inline-block h-3 w-3 rounded-full border-2 border-amber-500 border-t-transparent animate-spin" />
                               </span>
                             ) : (
-                              <span
-                                className="inline-block px-2 py-0.5 rounded text-[10px] font-bold min-w-[36px] text-center"
-                                style={{ backgroundColor: statusStyle.bg, color: statusStyle.text }}
-                              >
-                                {log.status || "..."}
+                              <span className="inline-flex items-center gap-1">
+                                <span
+                                  className="inline-block px-2 py-0.5 rounded text-[10px] font-bold min-w-[36px] text-center"
+                                  style={{
+                                    backgroundColor: statusStyle.bg,
+                                    color: statusStyle.text,
+                                  }}
+                                >
+                                  {log.status || "..."}
+                                </span>
+                                {log.groupStatus === "healed" &&
+                                  !log.isRetry &&
+                                  log.status >= 400 && (
+                                    <span
+                                      className="text-emerald-500 text-[11px]"
+                                      title={t("status.recoveredByRetry")}
+                                    >
+                                      ✓
+                                    </span>
+                                  )}
+                                {log.isRetry && (
+                                  <button
+                                    className="inline-flex items-center text-amber-500 hover:text-amber-400 text-[11px] ml-0.5"
+                                    title={t("status.goToParent")}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      const parent = groupedLogs.find(
+                                        (g) => g.correlationId === log.correlationId && !g.isRetry
+                                      );
+                                      if (parent) openDetail(parent);
+                                    }}
+                                  >
+                                    ↳
+                                  </button>
+                                )}
                               </span>
                             )}
                           </td>
@@ -1069,7 +1407,57 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
                         )}
                         {visibleColumns.model && (
                           <td className="px-3 py-2 font-medium text-primary font-mono text-[11px]">
-                            {log.model}
+                            <div className="flex items-center gap-1.5">
+                              <span>{log.model}</span>
+                              {log.groupStatus === "healed" && !log.isRetry && (
+                                <span
+                                  className="inline-flex items-center gap-0.5 px-1 py-0 rounded text-[8px] font-bold bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/25"
+                                  title={t("status.healedTitle", { count: log.groupSize - 1 })}
+                                >
+                                  {t("status.healed")}
+                                </span>
+                              )}
+                              {log.groupStatus === "failed" && !log.isRetry && (
+                                <span
+                                  className="inline-flex items-center gap-0.5 px-1 py-0 rounded text-[8px] font-bold bg-red-500/15 text-red-600 dark:text-red-400 border border-red-500/25"
+                                  title={t("status.failedTitle", { count: log.groupSize })}
+                                >
+                                  {t("status.failed")}
+                                </span>
+                              )}
+                              {log.modelPinned && (
+                                <span
+                                  className="inline-flex items-center gap-0.5 px-1 py-0 rounded text-[8px] font-bold bg-violet-500/15 text-violet-600 dark:text-violet-400 border border-violet-500/25"
+                                  title={t("status.pinnedTitle")}
+                                >
+                                  {t("status.pinned")}
+                                </span>
+                              )}
+                            </div>
+                            {log.correlationId && !log.isRetry && log.groupSize > 1 && (
+                              <div
+                                className="text-[9px] text-text-muted font-normal truncate max-w-[120px]"
+                                title={log.correlationId}
+                              >
+                                {log.correlationId.slice(0, 12)}… · {log.groupSize} {t("attempts")}
+                              </div>
+                            )}
+                            {log.correlationId && !log.isRetry && log.groupSize <= 1 && (
+                              <div
+                                className="text-[9px] text-text-muted font-normal truncate max-w-[120px]"
+                                title={log.correlationId}
+                              >
+                                {log.correlationId.slice(0, 12)}…
+                              </div>
+                            )}
+                            {log.correlationId && log.isRetry && (
+                              <div
+                                className="text-[9px] text-amber-500/70 font-normal truncate max-w-[120px]"
+                                title={log.correlationId}
+                              >
+                                {log.correlationId.slice(0, 12)}…
+                              </div>
+                            )}
                           </td>
                         )}
                         {visibleColumns.requestedModel && (
@@ -1176,6 +1564,30 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
                                 <span className="text-emerald-700 dark:text-emerald-400">
                                   {log.tokens?.out?.toLocaleString() || 0}
                                 </span>
+                                {log.tokens?.cacheRead != null && log.tokens.cacheRead > 0 && (
+                                  <>
+                                    <span className="mx-1 text-border">|</span>
+                                    <span className="text-text-muted">CR:</span>{" "}
+                                    <span
+                                      className="text-sky-700 dark:text-sky-400"
+                                      title={tCache("cachedTokensCol")}
+                                    >
+                                      {log.tokens.cacheRead.toLocaleString()}
+                                    </span>
+                                  </>
+                                )}
+                                {log.tokens?.cacheWrite != null && log.tokens.cacheWrite > 0 && (
+                                  <>
+                                    <span className="mx-1 text-border">|</span>
+                                    <span className="text-text-muted">CW:</span>{" "}
+                                    <span
+                                      className="text-amber-700 dark:text-amber-400"
+                                      title={tCache("cacheCreation")}
+                                    >
+                                      {log.tokens.cacheWrite.toLocaleString()}
+                                    </span>
+                                  </>
+                                )}
                                 {log.tokens?.compressed != null && log.tokens.compressed > 0 && (
                                   <>
                                     <span className="mx-1 text-border">|</span>
@@ -1225,6 +1637,15 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
                             {formatTime(log.timestamp)}
                           </td>
                         )}
+                        {visibleColumns.conversation && (
+                          <td className="px-3 py-2 font-mono text-[10px] text-text-muted">
+                            {log.sessionTag ? (
+                              <span title={log.sessionTag}>{log.sessionTag.slice(0, 12)}…</span>
+                            ) : (
+                              <span className="text-text-muted">—</span>
+                            )}
+                          </td>
+                        )}
                       </tr>
                     );
                   })}
@@ -1269,6 +1690,15 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
             onCopy={copyToClipboard}
             onPrevious={handlePrev}
             onNext={handleNext}
+            relatedLogs={
+              selectedLog.correlationId
+                ? groupedLogs.filter((l) => l.correlationId === selectedLog.correlationId)
+                : []
+            }
+            onSelectRelated={(r) => {
+              closeDetail();
+              openDetail(r);
+            }}
           />
         )}
       </div>

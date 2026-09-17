@@ -25,6 +25,46 @@ import {
 } from "../../lib/db/domainState";
 import type { FailureKind } from "./classify429";
 
+/**
+ * #4602 — Detect a LOCAL stream-lifecycle error that must NOT count as a
+ * whole-provider failure. The Codex WebSocket→SSE bridge can throw a bare
+ * `Invalid state: Controller is already closed` (an enqueue-after-close on our
+ * own ReadableStream controller). It carries no `statusCode`, so it defaults to
+ * HTTP 502 and would otherwise trip the provider circuit breaker — blacklisting
+ * the entire Codex provider for a bug that lives in our bridge, not upstream.
+ *
+ * The same policy applies to CLIENT-side aborts: when the caller drops the
+ * connection mid-stream (combo race loser, model switch, tab close), the
+ * in-flight leg surfaces `request_signal_aborted` / `Client disconnected` /
+ * `AbortError` with no upstream status. Counting those as provider failures
+ * cascades one user action into provider cooldowns (`lastErrorCode=null`,
+ * `lastError=undefined`) and can dead-end a combo on its last resort target.
+ *
+ * Use this with the breaker's `isFailure` option so local lifecycle errors are
+ * ignored by the provider breaker while genuine upstream 5xx failures still count.
+ */
+export function isLocalStreamLifecycleError(error: unknown): boolean {
+  if (!error) return false;
+  const errName =
+    typeof (error as { name?: unknown }).name === "string"
+      ? ((error as { name: string }).name as string)
+      : "";
+  if (errName === "AbortError") return true;
+  const message =
+    typeof error === "string"
+      ? error
+      : typeof (error as { message?: unknown }).message === "string"
+        ? ((error as { message: string }).message as string)
+        : "";
+  if (!message) return false;
+  return (
+    /controller is already closed/i.test(message) ||
+    /request_signal_aborted/i.test(message) ||
+    /client disconnected/i.test(message) ||
+    /operation was aborted/i.test(message)
+  );
+}
+
 export const STATE = {
   CLOSED: "CLOSED",
   DEGRADED: "DEGRADED",
@@ -73,12 +113,26 @@ interface CircuitBreakerOptions {
   backoffEscalationCount?: number;
 }
 
-interface TransitionRecord {
+export interface TransitionRecord {
   from: string;
   to: string;
   timestamp: number;
   failureCount: number;
   reason?: string;
+}
+
+export interface CircuitBreakerStatus {
+  name: string;
+  state: string;
+  failureCount: number;
+  lastFailureTime: number | null;
+  retryAfterMs: number;
+  lastFailureKind: string | null;
+  openCycleCount: number;
+  kindFailureCounts: Record<string, number>;
+  degradationThreshold: number;
+  effectiveResetTimeout: number;
+  transitionHistory: TransitionRecord[];
 }
 
 export class CircuitBreaker {
@@ -260,7 +314,7 @@ export class CircuitBreaker {
     return false;
   }
 
-  getStatus() {
+  getStatus(): CircuitBreakerStatus {
     this._refreshOpenState();
     return {
       name: this.name,
@@ -273,6 +327,7 @@ export class CircuitBreaker {
       kindFailureCounts: { ...this.kindFailureCounts },
       degradationThreshold: this.degradationThreshold,
       effectiveResetTimeout: this._effectiveResetTimeout(),
+      transitionHistory: [...this.transitionHistory],
     };
   }
 
@@ -455,6 +510,11 @@ export class CircuitBreakerOpenError extends Error {
 const MAX_REGISTRY_SIZE = 500;
 const registry = new Map<string, CircuitBreaker>();
 
+/** Test-only: current number of registered circuit breakers. */
+export function __getCircuitRegistrySizeForTests(): number {
+  return registry.size;
+}
+
 const _registrySweep = setInterval(() => {
   const now = Date.now();
   for (const [name, breaker] of registry) {
@@ -475,8 +535,37 @@ if (typeof _registrySweep === "object" && "unref" in _registrySweep) {
   (_registrySweep as { unref?: () => void }).unref?.();
 }
 
+/**
+ * Enforce MAX_REGISTRY_SIZE before inserting a new breaker. The cap was previously declared
+ * but never used — the only bound was the 5-min sweep, which evicts a breaker only if it is
+ * CLOSED, has zero failures, AND has been idle for >30 min. With high-cardinality breaker
+ * names that cap could be exceeded for up to 30 min. Evict idle CLOSED breakers (oldest first)
+ * to make room; never evict OPEN/HALF_OPEN breakers, since those carry meaningful state. A
+ * CLOSED breaker with zero failures is behaviorally identical to a freshly-created one, so
+ * evicting and lazily recreating it later changes nothing.
+ */
+function evictColdBreakersIfNeeded(): void {
+  if (registry.size < MAX_REGISTRY_SIZE) return;
+  const candidates: { name: string; lastFailureTime: number }[] = [];
+  for (const [name, breaker] of registry) {
+    const status = breaker.getStatus();
+    if (status.state === STATE.CLOSED && status.failureCount === 0) {
+      candidates.push({ name, lastFailureTime: status.lastFailureTime || 0 });
+    }
+  }
+  candidates.sort((a, b) => a.lastFailureTime - b.lastFailureTime);
+  const target = registry.size - MAX_REGISTRY_SIZE + 1;
+  for (let i = 0; i < candidates.length && i < target; i++) {
+    registry.delete(candidates[i].name);
+    try {
+      deleteCircuitBreakerState(candidates[i].name);
+    } catch {}
+  }
+}
+
 export function getCircuitBreaker(name: string, options?: CircuitBreakerOptions): CircuitBreaker {
   if (!registry.has(name)) {
+    evictColdBreakersIfNeeded();
     registry.set(name, new CircuitBreaker(name, options));
   }
   const breaker = registry.get(name)!;

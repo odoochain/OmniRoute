@@ -85,7 +85,7 @@ function clonePayloadRulesConfig(config: PayloadRulesConfig): PayloadRulesConfig
 
 function normalizeModelSpecs(value: unknown): PayloadRuleModelSpec[] {
   return toArray<JsonRecord>(value)
-    .map((item) => {
+    .map((item): PayloadRuleModelSpec | null => {
       const name = typeof item?.name === "string" ? item.name.trim() : "";
       const protocol = typeof item?.protocol === "string" ? item.protocol.trim() : "";
       if (!name) return null;
@@ -399,7 +399,7 @@ export function resolvePayloadRuleProtocols({
   if (targetFormat === "openai-responses" || targetFormat === "openai-response") {
     protocols.add("openai");
   }
-  if (targetFormat === "gemini-cli" || targetFormat === "antigravity") {
+  if (targetFormat === "antigravity") {
     protocols.add("gemini");
   }
 

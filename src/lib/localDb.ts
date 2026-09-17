@@ -9,30 +9,30 @@
 export {
   // Provider Connections
   getProviderConnections,
+  getProviderConnectionsCount,
   getProviderConnectionById,
   createProviderConnection,
   updateProviderConnection,
+  resetConnectionBackoff,
+  clearConnectionErrorIfUnchanged,
+  touchConnectionLastUsed,
   deleteProviderConnection,
   deleteProviderConnections,
   deleteProviderConnectionsByProvider,
   reorderProviderConnections,
   cleanupProviderConnections,
-
-  // Provider Nodes
   getProviderNodes,
+  getProviderNodesCount,
   getProviderNodeById,
+  resolveProviderNodeForConnection,
   createProviderNode,
   updateProviderNode,
   deleteProviderNode,
-
   // T05: Rate-limit DB persistence (survives token refresh)
   setConnectionRateLimitUntil,
   isConnectionRateLimited,
   getRateLimitedConnections,
-
-  // T05 startup recovery: clear stale transient cooldowns left by a prior crash
   clearStaleCrashCooldowns,
-
   // T13: Stale quota display fix (zero out usage after window resets)
   getEffectiveQuotaUsage,
   formatResetCountdown,
@@ -43,6 +43,7 @@ export {
   getModelAliases,
   setModelAlias,
   deleteModelAlias,
+  deleteModelAliasesForProvider,
 
   // MITM Alias
   getMitmAlias,
@@ -63,10 +64,11 @@ export {
   getModelUpstreamExtraHeaders,
   getModelIsHidden,
   setModelIsHidden,
-
+  getHiddenModelsByProvider,
   // Synced Available Models
   getSyncedAvailableModels,
   getAllSyncedAvailableModels,
+  getActiveProvidersWithSyncedModel,
   replaceSyncedAvailableModelsForConnection,
   deleteSyncedAvailableModelsForConnection,
   deleteSyncedAvailableModelsForProvider,
@@ -78,20 +80,27 @@ export type { ModelCompatPerProtocol, ModelCompatPatch, SyncedAvailableModel } f
 export {
   // Combos
   getCombos,
+  getCombosCount,
   getComboById,
   getComboByName,
+  getComboByNameInsensitive,
   createCombo,
   updateCombo,
   reorderCombos,
   deleteCombo,
 } from "./db/combos";
-
+export * from "./db/ccrBlocks";
 export * from "./db/compressionCacheStats";
 export * from "./db/compressionCombos";
+export * from "./db/compressionContextBudget";
+export * from "./db/compressionRunTelemetry";
+export * from "./db/jobRegistryDb";
+export * from "./db/modelContextOverrides";
+export * from "./db/responsesContinuationStore";
 
 export {
-  // API Keys
   getApiKeys,
+  getApiKeysCount,
   getApiKeyById,
   createApiKey,
   deleteApiKey,
@@ -100,8 +109,10 @@ export {
   updateApiKeyPermissions,
   regenerateApiKey,
   isModelAllowedForKey,
+  pickApiKeyForInternalUse,
   clearApiKeyCaches,
   resetApiKeyState,
+  ApiKeyPolicyInvariantError,
 } from "./db/apiKeys";
 
 export {
@@ -128,12 +139,14 @@ export type {
 export {
   // Settings
   getSettings,
+  getSettingsRevision,
   updateSettings,
   isCloudEnabled,
 
   // LKGP (Last Known Good Provider) (#919)
   getLKGP,
   setLKGP,
+  clearLKGP,
 
   // Pricing
   getPricing,
@@ -162,6 +175,8 @@ export {
 
 export type { UserDatabaseSettings } from "./db/databaseSettings";
 
+export * from "./db/exclusiveConnectionLeases";
+
 export {
   // Proxy Registry
   listProxies,
@@ -175,6 +190,11 @@ export {
   getProxyAssignments,
   getProxyWhereUsed,
   assignProxyToScope,
+  addProxyToScopePool,
+  removeProxyFromScopePool,
+  getScopeProxyPool,
+  setScopeRotationStrategy,
+  getScopeRotationStrategy,
   resolveProxyForConnectionFromRegistry,
   resolveProxyForProvider,
   resolveProxyForScopeFromRegistry,
@@ -202,6 +222,7 @@ export {
   getDbBackupMaxFiles,
   setDbBackupMaxFiles,
   getDbBackupRetentionDays,
+  setDbBackupRetentionDays,
   listDbBackups,
   restoreDbBackup,
   // Export-All / Import helpers (#3500 slice 5)
@@ -224,6 +245,9 @@ export {
   getCachedSettings,
   getCachedPricing,
   getCachedProviderConnections,
+  getCachedRawProviderConnections,
+  getCachedProviderConnectionById,
+  getCachedProviderNodes,
   getCachedLKGP,
   setCachedLKGP,
   invalidateDbCache,
@@ -284,15 +308,22 @@ export {
   countBatches,
   getPendingBatches,
   getTerminalBatches,
+  ensureBatchItemCheckpoints,
+  countBatchItemCheckpoints,
+  listBatchItemCheckpoints,
+  markBatchItemProcessing,
+  markBatchItemResult,
+  markBatchItemError,
   deleteBatch,
   deleteCompletedBatches,
 } from "./db/batches";
 
 export type { FileRecord } from "./db/files";
-export type { BatchRecord } from "./db/batches";
+export type { BatchItemCheckpoint, BatchRecord } from "./db/batches";
 
 export type { ModelComboMapping } from "./db/modelComboMappings";
-
+export * from "./db/reasoningRoutingRules";
+export * from "./db/autoCandidateOverrides";
 export {
   // Webhooks
   getWebhooks,
@@ -308,6 +339,22 @@ export {
 export type { Webhook, WebhookKind } from "./db/webhooks";
 
 export { insertDelivery, getDeliveries } from "./db/webhookDeliveries";
+
+export {
+  upsertDiscoveryResult,
+  getDiscoveryResults,
+  getDiscoveryResultById,
+  markVerified,
+  deleteDiscoveryResult,
+} from "./db/discoveryResults";
+
+export type {
+  DiscoveryResult,
+  DiscoveryMethod,
+  DiscoveryAuthType,
+  DiscoveryRiskLevel,
+  DiscoveryStatus,
+} from "./db/discoveryResults";
 export type { WebhookDelivery } from "./db/webhookDeliveries";
 
 export {
@@ -318,6 +365,7 @@ export {
 } from "./db/quotaSnapshots";
 
 export * from "./db/sessionAccountAffinity";
+export * from "./db/quotaResetEvents";
 
 export type { QuotaSnapshotRow, ProviderUtilizationPoint } from "@/shared/types/utilization";
 
@@ -409,6 +457,7 @@ export {
   upsertSessionAccountAffinity,
   touchSessionAccountAffinity,
   deleteSessionAccountAffinity,
+  evictSessionAccountAffinityForConnection,
   cleanupStaleSessionAccountAffinities,
   startSessionAccountAffinityCleanup,
   stopSessionAccountAffinityCleanupForTests,
@@ -521,16 +570,22 @@ export type {
 export {
   upsertFreeProxy,
   listFreeProxies,
+  countFreeProxies,
   listFreeProxiesBySource,
   getFreeProxyById,
   markFreeProxyInPool,
   promoteFreeProxyToPool,
   deleteFreeProxy,
   clearFreeProxiesBySource,
+  pruneStaleFreeProxies,
   getFreeProxyStats,
+  recordFreeProxySync,
+  recordFreeProxySyncErrors,
+  clearFreeProxySyncErrors,
+  getFreeProxySyncErrors,
 } from "./db/freeProxies";
 
-export type { FreeProxyRecord, FreeProxyStats } from "./db/freeProxies";
+export type { FreeProxyRecord, FreeProxyStats, FreeProxySyncErrors } from "./db/freeProxies";
 
 export {
   listPlaygroundPresets,
@@ -549,26 +604,29 @@ export {
   markAllMemoriesNeedReindex,
   getMemoryReindexQueue,
   countMemoryReindexPending,
+  type MemoryVecMeta,
 } from "./db/memoryVec";
-
-export type { MemoryVecMeta } from "./db/memoryVec";
 // T-A-F2: AgentBridge state/mappings/bypass + Inspector custom hosts/sessions
 export * from "./db/agentBridgeState";
 export * from "./db/agentBridgeMappings";
 export * from "./db/agentBridgeBypass";
 export * from "./db/inspectorCustomHosts";
 export * from "./db/inspectorSessions";
+export * from "./db/omp";
 // Quota Sharing — Group B (planos 16+22)
 export {
   listPools,
   getPool,
   getPoolsByGroup,
+  ensurePool,
   createPool,
   updatePool,
   deletePool,
   upsertAllocations,
   listAllocationsForApiKey,
 } from "./db/quotaPools";
+// Quota per-(key, model) caps — Group B Fase 3 #7
+export { getModelCap, listModelCaps, setModelCap, deleteModelCap } from "./db/quotaModelCaps";
 
 export {
   // Quota Groups (B2)
@@ -634,7 +692,7 @@ export {
   listApiKeyContextSources,
 } from "./db/apiKeyContextSources";
 export type { ApiKeyContextSource } from "./db/apiKeyContextSources";
-
+export * from "./db/localCorpus";
 export { sumUsageTokensThisMonth } from "./db/usageSummary";
 
 export {
@@ -713,7 +771,7 @@ export type {
 } from "./db/usageAnalytics";
 
 // ---------------------------------------------------------------------------
-// usage_logs — auto-routing analytics (#3500 slice 4)
+// call_logs auto-routing analytics (#3500 slice 4)
 // ---------------------------------------------------------------------------
 export {
   getAutoRoutingTotalCount,
@@ -746,3 +804,47 @@ export type {
 // proxy_logs — export query (#3500 slice 4)
 // ---------------------------------------------------------------------------
 export { exportProxyLogsSince } from "./db/proxyLogs";
+// ---------------------------------------------------------------------------
+// Per-connection 429 cooldown wrappers (#5957 / #5958 — Issue 1 follow-ups)
+// Logic lives in db/providers/rateLimit.ts (Hard Rule #2 — localDb is re-export
+// only); re-exported here for the historical localDb import contract.
+// ---------------------------------------------------------------------------
+export { markConnectionRateLimitedUntil, clearConnectionRateLimit } from "./db/providers";
+// Provider param filters — denylist/allowlist config per provider/model (#6625)
+export * from "./db/paramFilters";
+export * from "./db/interceptionRules"; // Per-model web-search/web-fetch interception rules (#3384)
+export * from "./db/relayProbeStats"; // Relay probe latency/health stats (#6909)
+export * from "./db/ccDiscoveryAliases"; // Claude Code discovery-alias gate (flag + per-provider/model overrides)
+export * from "./db/ccDiscoveryMetrics"; // Claude Code discovery-alias usage counters (alias requests + discovery hits)
+export * from "./db/functionalGatewayMirrors"; // Functional-gateway mirror gate (flag + per-provider/model overrides)
+// Radar client — local feed cache + settings (opt-in, encrypted supporter key)
+export {
+  getRadarCache,
+  setRadarCache,
+  getRadarSettings,
+  setRadarOptIn,
+  setRadarKey,
+  getRadarReferralsCache,
+  setRadarReferralsCache,
+  getRadarOffersCache,
+  setRadarOffersCache,
+  getRadarIntelCache,
+  setRadarIntelCache,
+  listRadarLocalModelState,
+  setRadarLocalModelOverride,
+  clearRadarLocalModelOverride,
+  setRadarModelTombstone,
+  getRadarLocalMergeState,
+} from "./db/radar";
+export type {
+  RadarCache,
+  RadarSettings,
+  RadarReferralsCache,
+  RadarOffersCache,
+  RadarIntelCache,
+  RadarLocalModelState,
+  RadarLocalModelOverridePatch,
+  RadarLocalMergeState,
+} from "./db/radar";
+export * from "./db/conductorBridge"; // OmniConductor hub mirror — SSE cursor (PRD Conductor RF1)
+export * from "./db/agenticConversations"; // Multi-turn conversation id tracking (X-ConversationId)

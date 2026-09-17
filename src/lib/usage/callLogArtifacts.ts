@@ -5,7 +5,8 @@ import { resolveDataDir } from "../dataPaths";
 import { getCallLogPipelineMaxSizeBytes, isChatDebugFileEnabled } from "../logEnv";
 
 const isCloud = typeof globalThis.caches === "object" && globalThis.caches !== null;
-const isBuildPhase = process.env.NEXT_PHASE === "phase-production-build";
+const isBuildPhase =
+  process.env.NEXT_PHASE === "phase-production-build" || process.env.OMNIROUTE_BUILDING === "1";
 const DATA_DIR = resolveDataDir({ isCloud });
 
 export const CALL_LOGS_DIR = isCloud ? null : path.join(DATA_DIR, "call_logs");
@@ -162,31 +163,31 @@ function serializeArtifactForStorage(artifact: CallLogArtifact): string {
   }
 
   const maxBytes = getArtifactMaxBytes(artifact);
-  const serialized = JSON.stringify(artifact, null, 2);
+  // Single-pass, non-pretty serialization on the hot path. Artifacts are machine-read via
+  // JSON.parse (readCallArtifact), so pretty-printing only doubled the bytes and CPU of
+  // serializing large request/response bodies on every request — a contributor to the
+  // CPU-runaway. The debug path above keeps pretty output for human inspection.
+  const serialized = JSON.stringify(artifact);
   if (Buffer.byteLength(serialized) <= maxBytes) {
     return serialized;
   }
 
-  const truncated = JSON.stringify(truncateArtifactForStorage(artifact), null, 2);
+  const truncated = JSON.stringify(truncateArtifactForStorage(artifact));
   if (Buffer.byteLength(truncated) <= maxBytes) {
     return truncated;
   }
 
-  const withoutPipeline = JSON.stringify(omitOversizedPipeline(artifact), null, 2);
+  const withoutPipeline = JSON.stringify(omitOversizedPipeline(artifact));
   if (Buffer.byteLength(withoutPipeline) <= maxBytes) {
     return withoutPipeline;
   }
 
-  const minimal = JSON.stringify(
-    {
-      ...omitOversizedPipeline(artifact),
-      requestBody: OMITTED_FOR_SIZE_LIMIT,
-      responseBody: OMITTED_FOR_SIZE_LIMIT,
-      error: artifact.error ? OMITTED_FOR_SIZE_LIMIT : null,
-    },
-    null,
-    2
-  );
+  const minimal = JSON.stringify({
+    ...omitOversizedPipeline(artifact),
+    requestBody: OMITTED_FOR_SIZE_LIMIT,
+    responseBody: OMITTED_FOR_SIZE_LIMIT,
+    error: artifact.error ? OMITTED_FOR_SIZE_LIMIT : null,
+  });
   if (Buffer.byteLength(minimal) <= maxBytes) {
     return minimal;
   }
@@ -253,13 +254,22 @@ export function readCallArtifact(relativePath: string | null): {
   }
 }
 
-export function deleteCallArtifact(relativePath: string | null): boolean {
-  if (!CALL_LOGS_DIR || !relativePath) return false;
+export function deleteCallArtifact(relativePath: string | null, baseDir = CALL_LOGS_DIR): boolean {
+  if (!baseDir || !relativePath) return false;
 
   try {
-    const absPath = path.join(CALL_LOGS_DIR, relativePath);
+    const resolvedBaseDir = path.resolve(baseDir);
+    const absPath = path.join(resolvedBaseDir, relativePath);
     if (!fs.existsSync(absPath)) return false;
     fs.rmSync(absPath, { force: true });
+    const parentDir = path.dirname(absPath);
+    if (parentDir !== resolvedBaseDir) {
+      try {
+        fs.rmdirSync(parentDir);
+      } catch {
+        // Directory is non-empty or already gone.
+      }
+    }
     return true;
   } catch {
     return false;

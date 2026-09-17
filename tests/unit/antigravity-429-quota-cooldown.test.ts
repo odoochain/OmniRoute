@@ -30,7 +30,7 @@ import { markConnectionQuotaExhausted } from "../../open-sse/executors/antigravi
 
 test.after(() => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 // ── Engine contract (regression guard) ───────────────────────────────────────
@@ -53,6 +53,31 @@ test("classify429: AG 'Individual quota reached' message → quota_exhausted", (
   const msg =
     "Individual quota reached. Contact your administrator to enable overages. Resets in 14h22m.";
   assert.equal(classify429(msg), "quota_exhausted");
+});
+
+test("classify429: AG G1 Credits Exhausted message → quota_exhausted", () => {
+  assert.equal(classify429("insufficient_g1_credits_balance"), "quota_exhausted");
+});
+
+test("classify429: standard Gemini rate limit 'resource has been exhausted' -> rate_limited or unknown, not quota_exhausted", () => {
+  const msg =
+    "RESOURCE_EXHAUSTED: Resource has been exhausted (e.g. queries per minute limit was reached).";
+  const result = classify429(msg);
+  assert.notEqual(
+    result,
+    "quota_exhausted",
+    "RESOURCE_EXHAUSTED rate limit should not be classified as quota_exhausted"
+  );
+});
+
+test("classify429: exhausted capacity with reset after 0s is rate_limited", () => {
+  const message = "You have exhausted your capacity on this model. Your quota will reset after 0s.";
+  const category = classify429(message);
+  assert.equal(category, "rate_limited");
+
+  const decision = decide429(category, 2_000);
+  assert.equal(decision.kind, "soft_retry");
+  assert.equal(decision.retryAfterMs, 2_000);
 });
 
 // ── DB persistence (the missing wire — Bug #2) ───────────────────────────────

@@ -1,3 +1,4 @@
+import { protectPipelinePayloads } from "../../src/lib/usage/callLogs/format.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -34,6 +35,76 @@ test("normalizes JSON strings before log protection and redacts sensitive keys",
   });
 });
 
+test("redacts web-impersonation body credentials but preserves non-secret 'capability' diagnostics", () => {
+  const protectedPayload = protectPayloadForLog(
+    JSON.stringify({
+      // real browser-storage credentials that can land in a body field
+      cookie: "ecto_1_sess=abc123",
+      storageState: "{...}",
+      runtimeKey: "rk_live_secret",
+      // non-secret diagnostic fields that happen to be named 'capability' /
+      // 'capabilities' — must survive so call-log artifacts stay useful (#10952
+      // review: do not blanket-redact the generic word 'capability').
+      capability: "Reduced capability (fallback active)",
+      model: {
+        id: "claude-opus-4.8",
+        capabilities: { type: "chat", supports: { vision: true } },
+      },
+    })
+  );
+
+  assert.deepEqual(protectedPayload, {
+    cookie: "[REDACTED]",
+    storageState: "[REDACTED]",
+    runtimeKey: "[REDACTED]",
+    capability: "Reduced capability (fallback active)",
+    model: {
+      id: "claude-opus-4.8",
+      capabilities: { type: "chat", supports: { vision: true } },
+    },
+  });
+});
+
+test("omits encrypted reasoning values from structured log payloads", () => {
+  const encryptedContent = "encrypted".repeat(128);
+  const payload = {
+    output: [
+      {
+        type: "reasoning",
+        encrypted_content: encryptedContent,
+        reasoning_content: "visible diagnostic reasoning",
+      },
+    ],
+  };
+
+  const protectedPayload = protectPayloadForLog(payload) as typeof payload;
+
+  assert.equal(
+    protectedPayload.output[0].encrypted_content,
+    `[omitted: encrypted reasoning, ${encryptedContent.length} chars]`
+  );
+  assert.equal(protectedPayload.output[0].reasoning_content, "visible diagnostic reasoning");
+  assert.equal(payload.output[0].encrypted_content, encryptedContent);
+});
+
+test("omits encrypted reasoning split across captured SSE chunks", () => {
+  const encryptedContent = "opaque-replay-state".repeat(128);
+  const protectedPipeline = protectPipelinePayloads({
+    streamChunks: {
+      provider: [
+        '[12:00:00.000] data: {"type":"response.completed","response":{"output":[{"type":"reasoning","encrypted_',
+        `[12:00:00.001] content":"${encryptedContent}","summary":[]}]}}\n\n`,
+      ],
+    },
+  });
+
+  const storedChunks = protectedPipeline?.streamChunks?.provider ?? [];
+  assert.equal(storedChunks.length, 1);
+  assert.equal(storedChunks[0].includes(encryptedContent), false);
+  assert.equal(storedChunks[0].includes("[omitted: encrypted reasoning]"), true);
+  assert.equal(storedChunks[0].includes('"summary":[]'), true);
+});
+
 test("wraps raw text payloads in JSON-safe objects", () => {
   const normalized = normalizePayloadForLog("event: ping\ndata: plain-text\n\n");
 
@@ -52,7 +123,10 @@ test("serializes truncated payloads as valid JSON objects", () => {
 });
 
 test("structured SSE collector preserves event order and marks truncation", () => {
-  const collector = createStructuredSSECollector({ maxEvents: 2, maxBytes: 200 });
+  // Each collected event now also carries an ISO `timestamp` field (#5834 observability),
+  // which enlarges per-event bytes. Give the byte budget enough headroom so truncation
+  // here is driven by maxEvents (drop 1 of 3), which is what this test verifies.
+  const collector = createStructuredSSECollector({ maxEvents: 2, maxBytes: 2000 });
 
   collector.push({ type: "response.created", id: "r1" });
   collector.push({ type: "response.output_text.delta", delta: "hi" });

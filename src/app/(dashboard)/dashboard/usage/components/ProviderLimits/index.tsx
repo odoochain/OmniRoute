@@ -8,8 +8,11 @@ import {
   formatQuotaLabel,
   formatCountdown,
   normalizePlanTier,
-  resolvePlanValue,
+  buildProviderLimitsResolvedPlans,
   calculatePercentage,
+  matchesProviderFilter,
+  buildProviderOptions,
+  compareQuotaConnections,
 } from "./utils";
 import Card from "@/shared/components/Card";
 import { CardSkeleton } from "@/shared/components/Loading";
@@ -17,73 +20,40 @@ import { USAGE_SUPPORTED_PROVIDERS } from "@/shared/constants/providers";
 import { pickDisplayValue } from "@/shared/utils/maskEmail";
 import useEmailPrivacyStore from "@/store/emailPrivacyStore";
 import { useNotificationStore } from "@/store/notificationStore";
+
+import { useQuotaVisibility } from "./useQuotaVisibility";
 import QuotaCutoffModal from "./QuotaCutoffModal";
 import QuotaCardGrid from "./QuotaCardGrid";
+import CodexResetCreditsModal from "./CodexResetCreditsModal";
+import { useVisibleQuotaData } from "./useVisibleQuotaData";
+import { useCodexResetCreditRedemption } from "./useCodexResetCreditRedemption";
+import { PROVIDER_LABEL, PROVIDER_ORDER, TIER_FILTERS } from "./constants";
+import { formatAutoRefreshCountdown } from "./formatters";
 import { translateUsageOrFallback, type UsageTranslationValues } from "./i18nFallback";
 import { compareTr } from "@/shared/utils/turkishText";
+import { fetchWithTimeout } from "@/shared/utils/fetchTimeout";
+import { isProviderQuotaVisible } from "@/shared/utils/providerQuotaVisibility";
+
+// Bound the two first-paint requests so a stalled connection cannot wedge
+// `initialLoading` on `true` and freeze the quota page on its skeleton forever
+// (same infinite-skeleton class as the providers page). A `try/catch` degrades a
+// *rejection* to a default, but only a timeout/abort can rescue a `fetch()` that
+// never settles (browser connection-pool starvation under the RSC prefetch storm).
+const PROVIDER_LIMITS_FETCH_TIMEOUT_MS = 20_000;
 
 const LS_PURCHASE_FILTER = "omniroute:limits:purchaseFilter";
 const LS_STATUS_FILTER = "omniroute:limits:statusFilter";
 const LS_ENV_FILTER = "omniroute:limits:envFilter";
+const LS_PROVIDER_FILTER = "omniroute:limits:providerFilter";
+const LS_LAYOUT_MODE = "omniroute:limits:layoutMode";
 
 const MIN_FETCH_INTERVAL_MS = 30000;
 const QUOTA_BAR_GREEN_THRESHOLD = 50;
 const QUOTA_BAR_YELLOW_THRESHOLD = 20;
 
-// Display label per known provider; the icon is resolved by ProviderIcon.
-const PROVIDER_LABEL: Record<string, string> = {
-  antigravity: "Antigravity",
-  "gemini-cli": "Gemini CLI",
-  github: "GitHub Copilot",
-  kiro: "Kiro AI",
-  "amazon-q": "Amazon Q",
-  codex: "OpenAI Codex",
-  claude: "Claude Code",
-  glm: "GLM (Z.AI)",
-  zai: "Z.AI",
-  glmt: "GLM Thinking",
-  "opencode-go": "OpenCode Go",
-  "kimi-coding": "Kimi Coding",
-  minimax: "MiniMax",
-  "minimax-cn": "MiniMax CN",
-  nanogpt: "NanoGPT",
-  deepseek: "DeepSeek",
-};
-
-// Group ordering — single source of truth for "where does Codex sit
-// relative to Antigravity on the page".
-const PROVIDER_ORDER: Record<string, number> = {
-  antigravity: 1,
-  "gemini-cli": 2,
-  github: 3,
-  codex: 4,
-  claude: 5,
-  kiro: 6,
-  glm: 7,
-  zai: 8,
-  glmt: 9,
-  "opencode-go": 10,
-  "kimi-coding": 11,
-  minimax: 12,
-  "minimax-cn": 13,
-  nanogpt: 14,
-};
-
-const TIER_FILTERS = [
-  { key: "all", labelKey: "tierAll" },
-  { key: "enterprise", labelKey: "tierEnterprise" },
-  { key: "team", labelKey: "tierTeam" },
-  { key: "business", labelKey: "tierBusiness" },
-  { key: "ultra", labelKey: "tierUltra" },
-  { key: "pro", labelKey: "tierPro" },
-  { key: "plus", labelKey: "tierPlus" },
-  { key: "lite", labelKey: "tierLite" },
-  { key: "free", labelKey: "tierFree" },
-  { key: "unknown", labelKey: "tierUnknown" },
-];
-
 type PurchaseTypeKey = "all" | "oauth-free" | "oauth-sub" | "apikey";
 type StatusKey = "all" | "critical" | "alert" | "ok" | "empty";
+type LayoutMode = "full" | "compact";
 
 const PURCHASE_TYPES: Array<{ key: PurchaseTypeKey; labelKey: string; fallback: string }> = [
   { key: "all", labelKey: "purchaseAll", fallback: "All" },
@@ -210,13 +180,6 @@ function aggregateWorst(statuses: StatusKey[]): "critical" | "alert" | "ok" | "e
   return worst;
 }
 
-function formatAutoRefreshCountdown(ms: number): string {
-  const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
-}
-
 interface ProviderLimitsProps {
   showFilters?: boolean;
   autoRefreshInterval?: number;
@@ -243,6 +206,13 @@ export default function ProviderLimits({
   const [refreshingAll, setRefreshingAll] = useState(false);
   const [initialLoading, setInitialLoading] = useState(true);
   const [tierFilter, setTierFilter] = useState("all");
+  const { quotaVisibility, handleHideQuota, handleShowQuota } = useQuotaVisibility(tr, notify);
+  const resetCreditRedemption = useCodexResetCreditRedemption(
+    tr,
+    setErrors,
+    setQuotaData,
+    setLastRefreshedAt
+  );
 
   const [purchaseTypeFilter, setPurchaseTypeFilter] = useState<PurchaseTypeKey>(() => {
     if (typeof window === "undefined") return "all";
@@ -259,6 +229,14 @@ export default function ProviderLimits({
   const [envFilter, setEnvFilter] = useState<string>(() => {
     if (typeof window === "undefined") return "all";
     return localStorage.getItem(LS_ENV_FILTER) || "all";
+  });
+  const [providerFilter, setProviderFilter] = useState<string>(() => {
+    if (typeof window === "undefined") return "all";
+    return localStorage.getItem(LS_PROVIDER_FILTER) || "all";
+  });
+  const [layoutMode, setLayoutMode] = useState<LayoutMode>(() => {
+    if (typeof window === "undefined") return "full";
+    return localStorage.getItem(LS_LAYOUT_MODE) === "compact" ? "compact" : "full";
   });
 
   const lastFetchTimeRef = useRef<Record<string, number>>({});
@@ -311,7 +289,9 @@ export default function ProviderLimits({
 
   const fetchConnections = useCallback(async () => {
     try {
-      const response = await fetch("/api/providers/client");
+      const response = await fetchWithTimeout("/api/providers/client", {
+        timeoutMs: PROVIDER_LIMITS_FETCH_TIMEOUT_MS,
+      });
       if (!response.ok) throw new Error("Failed");
       const data = await response.json();
       const list = data.connections || [];
@@ -382,7 +362,9 @@ export default function ProviderLimits({
 
   const fetchCachedProviderLimits = useCallback(async () => {
     try {
-      const response = await fetch("/api/usage/provider-limits");
+      const response = await fetchWithTimeout("/api/usage/provider-limits", {
+        timeoutMs: PROVIDER_LIMITS_FETCH_TIMEOUT_MS,
+      });
       if (!response.ok) throw new Error("Failed");
       const data = await response.json();
       return data.caches || {};
@@ -546,6 +528,7 @@ export default function ProviderLimits({
     () =>
       connections.filter(
         (conn) =>
+          isProviderQuotaVisible(conn) &&
           USAGE_SUPPORTED_PROVIDERS.includes(conn.provider) &&
           (conn.authType === "oauth" || conn.authType === "apikey")
       ),
@@ -553,18 +536,20 @@ export default function ProviderLimits({
   );
 
   const sortedConnections = useMemo(() => {
-    return [...filteredConnections].sort(
-      (a, b) => (PROVIDER_ORDER[a.provider] || 99) - (PROVIDER_ORDER[b.provider] || 99)
+    return [...filteredConnections].sort((a, b) =>
+      compareQuotaConnections(a, b, {
+        providerOrder: PROVIDER_ORDER,
+        providerLabels: PROVIDER_LABEL,
+        compare: compareTr,
+      })
     );
   }, [filteredConnections]);
+  const visibleQuotaData = useVisibleQuotaData(sortedConnections, quotaData);
 
-  const resolvedPlanByConnection = useMemo(() => {
-    const out: Record<string, string | null> = {};
-    for (const conn of sortedConnections) {
-      out[conn.id] = resolvePlanValue(quotaData[conn.id]?.plan, conn.providerSpecificData);
-    }
-    return out;
-  }, [sortedConnections, quotaData]);
+  const resolvedPlanByConnection = useMemo(
+    () => buildProviderLimitsResolvedPlans(sortedConnections, quotaData),
+    [sortedConnections, quotaData]
+  );
 
   const tierByConnection = useMemo(() => {
     const out: Record<string, ReturnType<typeof normalizePlanTier>> = {};
@@ -606,10 +591,10 @@ export default function ProviderLimits({
   const statusByConnection = useMemo(() => {
     const out: Record<string, StatusKey> = {};
     for (const conn of sortedConnections) {
-      out[conn.id] = getWorstStatus(quotaData[conn.id]?.quotas);
+      out[conn.id] = getWorstStatus(visibleQuotaData[conn.id]?.quotas);
     }
     return out;
-  }, [sortedConnections, quotaData]);
+  }, [sortedConnections, visibleQuotaData]);
 
   const purchaseTypeCounts = useMemo(() => {
     const counts: Record<PurchaseTypeKey, number> = {
@@ -663,6 +648,7 @@ export default function ProviderLimits({
 
   const visibleConnections = useMemo(() => {
     const filtered = sortedConnections.filter((conn) => {
+      if (!matchesProviderFilter(conn, providerFilter)) return false;
       const tierKey = tierByConnection[conn.id]?.key || "unknown";
       if (tierFilter !== "all" && tierKey !== tierFilter) return false;
       if (purchaseTypeFilter !== "all" && purchaseTypeByConnection[conn.id] !== purchaseTypeFilter)
@@ -675,9 +661,10 @@ export default function ProviderLimits({
       return true;
     });
 
-    // Inside each group we still want "critical first, then alert, then ok,
-    // then empty; tiebreak by soonest reset". Provider order between groups
-    // is enforced separately via PROVIDER_ORDER.
+    // Provider rank stays the outer sort key so each group keeps its fixed
+    // slot (mirrors dashboard/providers determinism); "critical first, then
+    // alert, then ok, then empty; tiebreak by soonest reset" only orders
+    // accounts inside their own provider group.
     const statusRank: Record<StatusKey, number> = {
       critical: 0,
       alert: 1,
@@ -685,14 +672,21 @@ export default function ProviderLimits({
       empty: 3,
       all: 4,
     };
-    return [...filtered].sort((a, b) => {
-      const sa = statusRank[statusByConnection[a.id] || "empty"];
-      const sb = statusRank[statusByConnection[b.id] || "empty"];
-      if (sa !== sb) return sa - sb;
-      const ra = getSoonestResetMs(quotaData[a.id]?.quotas);
-      const rb = getSoonestResetMs(quotaData[b.id]?.quotas);
-      return ra - rb;
-    });
+    return [...filtered].sort((a, b) =>
+      compareQuotaConnections(a, b, {
+        providerOrder: PROVIDER_ORDER,
+        providerLabels: PROVIDER_LABEL,
+        compare: compareTr,
+        accountCompare: (x, y) => {
+          const sx = statusRank[statusByConnection[x.id] || "empty"];
+          const sy = statusRank[statusByConnection[y.id] || "empty"];
+          if (sx !== sy) return sx - sy;
+          const rx = getSoonestResetMs(visibleQuotaData[x.id]?.quotas);
+          const ry = getSoonestResetMs(visibleQuotaData[y.id]?.quotas);
+          return rx - ry;
+        },
+      })
+    );
   }, [
     sortedConnections,
     tierByConnection,
@@ -702,8 +696,17 @@ export default function ProviderLimits({
     statusFilter,
     statusByConnection,
     envFilter,
-    quotaData,
+    providerFilter,
+    visibleQuotaData,
   ]);
+
+  // Distinct provider keys present in the current connection set (after the
+  // upstream OAuth/api-key + USAGE_SUPPORTED_PROVIDERS filter), sorted via
+  // the i18n-aware comparator so the dropdown follows the locale's collation.
+  const providerOptions = useMemo(
+    () => buildProviderOptions(sortedConnections, compareTr),
+    [sortedConnections]
+  );
 
   // Auto-fetch LIVE quota on open for visible connections that have no cached
   // quota yet (e.g. a Codex account whose access_token expired — its per-connection
@@ -748,6 +751,27 @@ export default function ProviderLimits({
     } catch {
       /* ignore */
     }
+  }, []);
+
+  const handleSetProviderFilter = useCallback((value: string) => {
+    setProviderFilter(value);
+    try {
+      localStorage.setItem(LS_PROVIDER_FILTER, value);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const toggleLayoutMode = useCallback(() => {
+    setLayoutMode((current) => {
+      const next = current === "full" ? "compact" : "full";
+      try {
+        localStorage.setItem(LS_LAYOUT_MODE, next);
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
   }, []);
 
   const renderInlineQuotaSummary = (quotas: any[]) => {
@@ -820,30 +844,55 @@ export default function ProviderLimits({
           </span>
         </div>
 
-        <button
-          onClick={refreshAll}
-          disabled={refreshingAll}
-          className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-bg-subtle border border-border text-text-main text-[13px] disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-          title={
-            autoRefreshIntervalMs > 0 ? tr("autoRefreshing", "Auto-refreshing") : t("refreshAll")
-          }
-        >
-          <span
-            className={`material-symbols-outlined text-[16px] ${refreshingAll ? "animate-spin" : ""}`}
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={toggleLayoutMode}
+            aria-pressed={layoutMode === "compact"}
+            aria-label={
+              layoutMode === "compact"
+                ? "Switch to full quota layout"
+                : "Switch to compact quota layout"
+            }
+            title={
+              layoutMode === "compact"
+                ? "Switch to full quota layout"
+                : "Switch to compact quota layout"
+            }
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-bg-subtle border border-border text-text-main text-[13px] cursor-pointer"
           >
-            {autoRefreshIntervalMs > 0 ? "schedule" : "refresh"}
-          </span>
-          {refreshingAll
-            ? tr("refreshing", "Refreshing")
-            : autoRefreshIntervalMs > 0
-              ? `${tr("autoRefreshing", "Auto-refreshing")} ${formatAutoRefreshCountdown(
-                  Math.max(
-                    0,
-                    autoRefreshIntervalMs - (autoRefreshClock - lastRefreshAllAtRef.current)
-                  )
-                )}`
-              : t("refreshAll")}
-        </button>
+            <span className="material-symbols-outlined text-[16px]" aria-hidden>
+              {layoutMode === "compact" ? "view_agenda" : "grid_view"}
+            </span>
+            <span className="hidden sm:inline">
+              {layoutMode === "compact" ? "Compact" : "Full"}
+            </span>
+          </button>
+          <button
+            onClick={refreshAll}
+            disabled={refreshingAll}
+            className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-bg-subtle border border-border text-text-main text-[13px] disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+            title={
+              autoRefreshIntervalMs > 0 ? tr("autoRefreshing", "Auto-refreshing") : t("refreshAll")
+            }
+          >
+            <span
+              className={`material-symbols-outlined text-[16px] ${refreshingAll ? "animate-spin" : ""}`}
+            >
+              {autoRefreshIntervalMs > 0 ? "schedule" : "refresh"}
+            </span>
+            {refreshingAll
+              ? tr("refreshing", "Refreshing")
+              : autoRefreshIntervalMs > 0
+                ? `${tr("autoRefreshing", "Auto-refreshing")} ${formatAutoRefreshCountdown(
+                    Math.max(
+                      0,
+                      autoRefreshIntervalMs - (autoRefreshClock - lastRefreshAllAtRef.current)
+                    )
+                  )}`
+                : t("refreshAll")}
+          </button>
+        </div>
       </div>
 
       {showFilters && (
@@ -951,6 +1000,34 @@ export default function ProviderLimits({
             })}
           </div>
 
+          {/* Provider filter — single-select dropdown of providers actually
+              present in the current account set. Auto-falls back to "all" if
+              the persisted choice no longer exists in this session. */}
+          {providerOptions.length > 1 && (
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-[11px] uppercase tracking-wider text-text-muted font-semibold mr-1">
+                {tr("filterProviderLabel", "Provider")}
+              </span>
+              <select
+                value={
+                  providerFilter === "all" || providerOptions.includes(providerFilter)
+                    ? providerFilter
+                    : "all"
+                }
+                onChange={(event) => handleSetProviderFilter(event.target.value)}
+                aria-label={tr("filterProviderAriaLabel", "Filter quota providers")}
+                className="h-8 rounded-full border border-border bg-transparent px-3 text-xs font-semibold text-text-muted cursor-pointer"
+              >
+                <option value="all">{tr("filterProviderAll", "All providers")}</option>
+                {providerOptions.map((provider) => (
+                  <option key={provider} value={provider}>
+                    {PROVIDER_LABEL[provider] || provider}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
           {/* Env filter — only renders when at least one connection has a tag */}
           {envTags.length > 0 && (
             <div className="flex items-center gap-2 flex-wrap">
@@ -1001,7 +1078,7 @@ export default function ProviderLimits({
 
         <QuotaCardGrid
           connections={visibleConnections}
-          quotaData={quotaData}
+          quotaData={visibleQuotaData}
           loading={loading}
           errors={errors}
           lastRefreshedAt={lastRefreshedAt}
@@ -1010,16 +1087,34 @@ export default function ProviderLimits({
           renderInlineQuotaSummary={(quota) => renderInlineQuotaSummary(quota.quotas)}
           onRefresh={refreshProvider}
           onOpenCutoff={(conn) => {
-            const windows = (quotaData[conn.id]?.quotas || []).filter(
+            const windows = (visibleQuotaData[conn.id]?.quotas || []).filter(
               (q: any) => q && typeof q.name === "string" && !q.isCredits
             );
             setCutoffModalWindows(windows);
             setCutoffModalConn(conn);
           }}
+          onOpenResetCredits={resetCreditRedemption.openCodexResetCredits}
           onToggleActive={handleToggleActive}
           togglingActiveId={togglingActiveId}
+          quotaVisibility={quotaVisibility}
+          onHideQuota={handleHideQuota}
+          onShowQuota={handleShowQuota}
+          redeemingResetCreditId={resetCreditRedemption.redeemingResetCreditId}
+          loadingResetCreditsId={resetCreditRedemption.loadingResetCreditsId}
+          compact={layoutMode === "compact"}
         />
       </div>
+
+      {resetCreditRedemption.resetCreditPicker && (
+        <CodexResetCreditsModal
+          isOpen={true}
+          credits={resetCreditRedemption.resetCreditPicker.credits}
+          availableCount={resetCreditRedemption.resetCreditPicker.availableCount}
+          loading={resetCreditRedemption.redeemingResetCreditId !== null}
+          onClose={resetCreditRedemption.closeResetCreditPicker}
+          onRedeem={resetCreditRedemption.redeemCodexResetCredit}
+        />
+      )}
 
       {cutoffModalConn && (
         <QuotaCutoffModal
@@ -1028,6 +1123,7 @@ export default function ProviderLimits({
             setCutoffModalConn(null);
             setCutoffModalWindows([]);
           }}
+          connectionId={cutoffModalConn.id}
           connectionName={
             pickDisplayValue(
               [cutoffModalConn.name, cutoffModalConn.displayName, cutoffModalConn.email],

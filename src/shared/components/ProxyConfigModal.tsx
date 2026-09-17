@@ -4,6 +4,12 @@ import { useState, useEffect, useMemo } from "react";
 import { useTranslations } from "next-intl";
 import Modal from "./Modal";
 import Button from "./Button";
+import {
+  type ProxyAssignmentItem,
+  normalizeScopeId,
+  isSameScopeAssignment,
+  selectScopeAssignment,
+} from "./proxyAssignment";
 
 const ALL_PROXY_TYPES = [
   { value: "http", label: "HTTP" },
@@ -33,12 +39,6 @@ type ProxyRegistryItem = {
   source?: string | null;
 };
 
-type ProxyAssignmentItem = {
-  proxyId?: string | null;
-  scope?: string | null;
-  scopeId?: string | null;
-};
-
 type ProxyConfigModalProps = {
   isOpen: boolean;
   onClose: () => void;
@@ -57,20 +57,6 @@ function getAssignmentScope(level: ProxyConfigLevel) {
 
 function getAssignmentScopeId(level: ProxyConfigLevel, levelId?: string) {
   return level === "global" ? null : levelId || null;
-}
-
-function normalizeScopeId(scopeId?: string | null) {
-  return !scopeId || scopeId === "__global__" ? null : scopeId;
-}
-
-function isSameScopeAssignment(
-  assignment: ProxyAssignmentItem,
-  scope: string,
-  scopeId: string | null
-) {
-  return (
-    assignment.scope === scope && normalizeScopeId(assignment.scopeId) === normalizeScopeId(scopeId)
-  );
 }
 
 function getCustomProxyName(level: ProxyConfigLevel, levelId?: string, levelLabel?: string) {
@@ -95,7 +81,7 @@ async function fetchAssignmentForScope(scope: string, scopeId: string | null) {
 
   const payload = await readJson(res);
   const items: ProxyAssignmentItem[] = Array.isArray(payload?.items) ? payload.items : [];
-  return items.find((item) => isSameScopeAssignment(item, scope, scopeId)) || items[0] || null;
+  return selectScopeAssignment(items, scope, scopeId);
 }
 
 async function fetchRegistryProxy(proxyId: string, cachedProxies: ProxyRegistryItem[]) {
@@ -142,6 +128,10 @@ export default function ProxyConfigModal({
   const [selectedProxyId, setSelectedProxyId] = useState("");
   const [socks5Enabled, setSocks5Enabled] = useState(BUILD_TIME_SOCKS5);
   const proxyTypes = useMemo(() => buildProxyTypes(socks5Enabled), [socks5Enabled]);
+  const sortedSavedProxies = useMemo(
+    () => [...savedProxies].sort((a, b) => (a.name || "").localeCompare(b.name || "")),
+    [savedProxies]
+  );
   const [proxyType, setProxyType] = useState("http");
   const [host, setHost] = useState("");
   const [port, setPort] = useState("");
@@ -198,8 +188,7 @@ export default function ProxyConfigModal({
         if (assignmentRes.ok) {
           const assignmentPayload = await assignmentRes.json();
           const items = Array.isArray(assignmentPayload?.items) ? assignmentPayload.items : [];
-          const target =
-            items.find((item) => isSameScopeAssignment(item, scope, scopeId)) || items[0];
+          const target = selectScopeAssignment(items, scope, scopeId);
           if (target?.proxyId) {
             setSelectedProxyId(target.proxyId);
             setHasOwnProxy(true);
@@ -226,7 +215,11 @@ export default function ProxyConfigModal({
               setMode("saved");
             }
           } else {
-            setMode("custom");
+            if (registryItems.length === 0) {
+              setMode("custom");
+            } else {
+              setMode("saved");
+            }
             setSelectedProxyId("");
           }
         }
@@ -478,6 +471,7 @@ export default function ProxyConfigModal({
         username?: string;
         password?: string;
       } | null = null;
+      let testProxyId: string | null = null;
 
       if (mode === "saved") {
         if (!selectedProxyId) {
@@ -496,6 +490,7 @@ export default function ProxyConfigModal({
           host: found.host || "",
           port: String(found.port || 8080),
         };
+        testProxyId = selectedProxyId;
       } else {
         if (!String(host || "").trim()) {
           setTesting(false);
@@ -513,7 +508,7 @@ export default function ProxyConfigModal({
       const res = await fetch("/api/settings/proxy/test", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ proxy }),
+        body: JSON.stringify(testProxyId ? { proxy, proxyId: testProxyId } : { proxy }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
@@ -599,7 +594,7 @@ export default function ProxyConfigModal({
                 className="w-full px-3 py-2.5 rounded-lg bg-bg-subtle border border-border text-sm text-text-primary"
               >
                 <option value="">{t("selectSavedProxyPlaceholder")}</option>
-                {savedProxies.map((item: any) => (
+                {sortedSavedProxies.map((item: any) => (
                   <option key={item.id} value={item.id}>
                     {item.name} ({item.type}://{item.host}:{item.port})
                   </option>

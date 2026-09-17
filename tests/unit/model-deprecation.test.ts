@@ -23,6 +23,13 @@ test("resolveModelAlias: resolves deprecated Gemini model", () => {
   assert.equal(resolveModelAlias("gemini-pro"), "gemini-2.5-pro");
   assert.equal(resolveModelAlias("gemini-1.5-pro"), "gemini-2.5-pro");
   assert.equal(resolveModelAlias("gemini-1.5-flash"), "gemini-2.5-flash");
+  // Retired 2.0 Flash-Lite (Google shutdown 2026-06-01) + renamed flash-lite preview
+  // both forward to the live GA gemini-3.1-flash-lite.
+  assert.equal(resolveModelAlias("gemini-2.0-flash-lite"), "gemini-3.1-flash-lite");
+  assert.equal(resolveModelAlias("gemini-3.1-flash-lite-preview"), "gemini-3.1-flash-lite");
+  // Retired free Gemma (was in the gemini-free pool) forwards to the current
+  // gemini-free model instead of erroring with model-not-found.
+  assert.equal(resolveModelAlias("gemma-4"), "gemini-3.1-flash-lite");
 });
 
 test("resolveModelAlias: resolves deprecated Claude model", () => {
@@ -30,9 +37,9 @@ test("resolveModelAlias: resolves deprecated Claude model", () => {
   assert.equal(resolveModelAlias("claude-3-5-sonnet-latest"), "claude-sonnet-4-20250514");
 });
 
-test("resolveModelAlias: resolves deprecated OpenAI model", () => {
-  assert.equal(resolveModelAlias("gpt-4-turbo-preview"), "gpt-4-turbo");
-  assert.equal(resolveModelAlias("gpt-3.5-turbo-0125"), "gpt-3.5-turbo");
+test("resolveModelAlias: does not silently reroute retired OpenAI models", () => {
+  assert.equal(resolveModelAlias("gpt-4-turbo-preview"), "gpt-4-turbo-preview");
+  assert.equal(resolveModelAlias("gpt-3.5-turbo-0125"), "gpt-3.5-turbo-0125");
 });
 
 test("resolveModelAlias: handles null/empty", () => {

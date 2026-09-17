@@ -20,24 +20,37 @@
 //   zizmorFindings=<n>     — findings from zizmor alone
 //
 // Exit codes:
-//   0  — SKIP (binary absent) or all tools passed (0 findings each)
-//   1  — one or more findings (gate failure; advisory mode = always 0; see --advisory)
+//   0  — SKIP (binary absent) or all tools passed / no ratchet regression
+//   1  — gate failure: --strict + any finding, OR --ratchet + zizmorFindings
+//        regression (measured > baseline)
+//
+// Ratchet mode (--ratchet): reads metrics.zizmorFindings.value from
+// config/quality/quality-baseline.json and exits 1 IF — AND ONLY IF — the MEASURED
+// zizmor count is GREATER than the baseline (real regression, direction:down).
+// ONLY zizmorFindings is ratcheted; actionlint findings are REPORTED but NOT
+// ratcheted (use the separate --strict all-or-nothing flag for those). Any graceful
+// SKIP (binary absent, no workflows) exits 0 even with --ratchet — missing infra
+// never blocks, only a measured regression does.
 //
 // Usage:
 //   node scripts/check/check-workflows.mjs               # advisory (exit 0 always)
 //   node scripts/check/check-workflows.mjs --strict      # fail on any finding
+//   node scripts/check/check-workflows.mjs --ratchet     # fail on zizmor regression
 //   node scripts/check/check-workflows.mjs --quiet       # suppress progress logs
 
 import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { findProvenanceOnSelfHosted, formatProvenanceFinding } from "./lib/provenanceRunner.mjs";
 
 const ROOT = process.cwd();
 const WORKFLOWS_DIR = path.join(ROOT, ".github", "workflows");
 const ZIZMOR_CONFIG = path.join(ROOT, ".zizmor.yml");
+const BASELINE_PATH = path.join(ROOT, "config/quality/quality-baseline.json");
 
 const STRICT = process.argv.includes("--strict");
+const RATCHET = process.argv.includes("--ratchet");
 const QUIET = process.argv.includes("--quiet");
 
 // ---------------------------------------------------------------------------
@@ -130,6 +143,46 @@ export function parseZizmorOutput(stdout) {
 }
 
 // ---------------------------------------------------------------------------
+// Ratchet (direction:down, zizmorFindings only) — exported for tests
+// ---------------------------------------------------------------------------
+
+/**
+ * Evaluates the MEASURED zizmor finding count against the baseline.
+ * Direction: down (the count may only DROP — more findings = regression).
+ *
+ * @param {number} current  - Measured zizmor finding count.
+ * @param {number} baseline - Frozen count in quality-baseline.json.
+ * @returns {{ regressed: boolean, improved: boolean }}
+ */
+export function evaluateZizmorRatchet(current, baseline) {
+  return {
+    regressed: current > baseline,
+    improved: current < baseline,
+  };
+}
+
+/**
+ * Reads metrics.zizmorFindings.value from quality-baseline.json.
+ * Returns null when the file or metric is missing (no baseline → no ratchet
+ * possible; the caller treats this as a graceful SKIP, exit 0).
+ *
+ * @param {string} baselinePath
+ * @returns {number|null}
+ */
+export function readBaselineZizmorValue(baselinePath = BASELINE_PATH) {
+  if (!fs.existsSync(baselinePath)) return null;
+  let baselineJson;
+  try {
+    baselineJson = JSON.parse(fs.readFileSync(baselinePath, "utf8"));
+  } catch {
+    return null;
+  }
+  const metric = baselineJson?.metrics?.zizmorFindings;
+  if (!metric || typeof metric.value !== "number") return null;
+  return metric.value;
+}
+
+// ---------------------------------------------------------------------------
 // Runner helpers
 // ---------------------------------------------------------------------------
 
@@ -183,6 +236,23 @@ export function runActionlint(files) {
  * @param {string} workflowsDir - Path to .github/workflows
  * @returns {{ count: number, diagnostics: unknown[], skipped: boolean }}
  */
+/**
+ * The zizmor version actually doing the auditing, or "unknown".
+ *
+ * Emitted next to the count because the two must be read together. The GitHub runner measured
+ * 1 finding MORE than the devbox on the identical commit (190 vs 189) during the v3.8.49 cycle,
+ * which cost a second rebaseline push: CI installed whatever PyPI served that day while the
+ * devbox had an older build. A count without the version that produced it is not a
+ * reproducible number, and rebaselining against it just moves the disagreement.
+ */
+export function zizmorVersion() {
+  try {
+    return execFileSync("zizmor", ["--version"], { encoding: "utf8" }).trim() || "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
 export function runZizmor(workflowsDir) {
   const args = ["--format", "json"];
   if (fs.existsSync(ZIZMOR_CONFIG)) {
@@ -206,6 +276,23 @@ export function runZizmor(workflowsDir) {
 // Main
 // ---------------------------------------------------------------------------
 
+/**
+ * Hard rule (not a lint count): `--provenance` inside a job that runs on a
+ * self-hosted runner. npm answers 422 at the registry, and in v3.8.50 that
+ * answer only came after the tag, the GitHub Release and the Docker images were
+ * already out. Blocks under --strict AND --ratchet (the CI mode); plain mode
+ * reports it like everything else.
+ * @param {string[]} files absolute workflow paths
+ */
+export function runProvenanceRunnerCheck(files) {
+  const findings = [];
+  for (const file of files) {
+    const text = fs.readFileSync(file, "utf8");
+    findings.push(...findProvenanceOnSelfHosted(text, path.relative(ROOT, file)));
+  }
+  return findings;
+}
+
 function main() {
   const hasActionlint = isBinaryAvailable("actionlint");
   const hasZizmor = isBinaryAvailable("zizmor");
@@ -216,7 +303,7 @@ function main() {
         "  Install them to enable workflow linting and security audit:\n" +
         "  • actionlint: https://github.com/rhysd/actionlint\n" +
         "  • zizmor:     https://github.com/woodruffw/zizmor\n" +
-        "  This gate is advisory — the build is not blocked."
+        "  Graceful SKIP — exits 0 even with --ratchet (missing binaries never block)."
     );
     process.stdout.write("workflowFindings=SKIP\n");
     process.exit(0);
@@ -226,7 +313,9 @@ function main() {
 
   if (workflowFiles.length === 0) {
     if (!QUIET) {
-      console.log(`[check-workflows] No workflow files found in ${WORKFLOWS_DIR} — nothing to check.`);
+      console.log(
+        `[check-workflows] No workflow files found in ${WORKFLOWS_DIR} — nothing to check.`
+      );
     }
     process.stdout.write("workflowFindings=0\nactionlintFindings=0\nzizmorFindings=0\n");
     process.exit(0);
@@ -279,22 +368,84 @@ function main() {
     }
   }
 
+  const provenanceFindings = runProvenanceRunnerCheck(workflowFiles);
+  if (provenanceFindings.length > 0) {
+    console.error(
+      `[check-workflows] provenance×self-hosted: ${provenanceFindings.length} finding(s) — HARD RULE:`
+    );
+    provenanceFindings.forEach((f) => console.error(`  ${formatProvenanceFinding(f)}`));
+  } else if (!QUIET) {
+    console.log("[check-workflows] provenance×self-hosted: OK (0 findings)");
+  }
+
   const total = actionlintCount + zizmorCount;
   process.stdout.write(`workflowFindings=${total}\n`);
   process.stdout.write(`actionlintFindings=${actionlintCount}\n`);
   process.stdout.write(`zizmorFindings=${zizmorCount}\n`);
-
-  if (STRICT && total > 0) {
+  // Read this line with the count above: a finding total is only reproducible against the
+  // version that produced it. See zizmorVersion().
+  process.stdout.write(`zizmorVersion=${hasZizmor ? zizmorVersion() : "absent"}\n`);
+  process.stdout.write(`provenanceRunnerFindings=${provenanceFindings.length}\n`);
+  if ((STRICT || RATCHET) && provenanceFindings.length > 0) {
     console.error(
-      `\n[check-workflows] FAIL — ${total} workflow finding(s) total (--strict mode).`
+      `\n[check-workflows] FAIL — ${provenanceFindings.length} job(s) publish with --provenance from a self-hosted runner.\n` +
+        "  npm rejects that with 422 at the registry. Move the upload step to a github-hosted job\n" +
+        "  (see .github/workflows/npm-publish.yml `stage-npm` for the pattern)."
     );
     process.exit(1);
+  }
+
+  if (STRICT && total > 0) {
+    console.error(`\n[check-workflows] FAIL — ${total} workflow finding(s) total (--strict mode).`);
+    process.exit(1);
+  }
+
+  // ── ratchet (zizmorFindings only, direction:down) ──────────────────────────
+  // We can only ratchet zizmor when zizmor actually RAN (binary present). If
+  // zizmor is absent we have no comparable measurement → graceful SKIP (exit 0):
+  // a missing binary must never block, only a measured regression does.
+  if (RATCHET) {
+    if (!hasZizmor) {
+      if (!QUIET) {
+        process.stderr.write(
+          "[check-workflows] --ratchet: zizmor absent — SKIP (no measurement, never blocks).\n"
+        );
+      }
+      process.exit(0);
+    }
+
+    const baselineValue = readBaselineZizmorValue(BASELINE_PATH);
+    if (baselineValue === null) {
+      if (!QUIET) {
+        process.stderr.write(
+          "[check-workflows] --ratchet: baseline absent (metrics.zizmorFindings) — SKIP, exit 0.\n"
+        );
+      }
+      process.exit(0);
+    }
+
+    const { regressed } = evaluateZizmorRatchet(zizmorCount, baselineValue);
+    if (regressed) {
+      console.error(
+        `\n[check-workflows] REGRESSION — ${zizmorCount} zizmor finding(s) > baseline ${baselineValue}.\n` +
+          "  → Fix the new workflow finding(s), or re-baseline metrics.zizmorFindings in\n" +
+          "    config/quality/quality-baseline.json if the rise is a legitimate, justified drift.\n" +
+          "  (actionlint findings are reported, not ratcheted — use --strict for those.)"
+      );
+      process.exit(1);
+    }
+    if (!QUIET) {
+      process.stderr.write(
+        `[check-workflows] --ratchet OK — ${zizmorCount} zizmor finding(s), baseline ${baselineValue} (no regression).\n`
+      );
+    }
+    process.exit(0);
   }
 
   if (total > 0 && !QUIET) {
     console.log(
       `[check-workflows] ADVISORY — ${total} finding(s) detected. ` +
-        "Pass --strict to block the gate."
+        "Pass --strict to block on any finding, or --ratchet to block on a zizmor regression."
     );
   }
 

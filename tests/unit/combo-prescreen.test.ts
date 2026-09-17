@@ -14,7 +14,7 @@ const combosDb = await import("../../src/lib/db/combos.ts");
 
 after(() => {
   dbCore.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   if (ORIGINAL_DATA_DIR === undefined) {
     delete process.env.DATA_DIR;
   } else {
@@ -202,4 +202,42 @@ test("pre-screen: backward compatible with all targets available", async () => {
   assert.equal(response.status, 200);
   assert.equal(calls.length, 1);
   assert.equal(calls[0], "p1/m1");
+});
+
+test("priority combo: quota 429 on passthrough provider does not skip another model on same provider", async () => {
+  const calls: string[] = [];
+
+  const combo = await combosDb.createCombo({
+    name: "passthrough-quota-scope",
+    strategy: "priority",
+    models: ["antigravity/claude-opus-4-6-thinking", "antigravity/gemini-3.7-flash-high"],
+  });
+
+  const response = await handleComboChat({
+    body: { ...reqBody, model: combo.name },
+    combo,
+    allCombos: [combo],
+    isModelAvailable: async () => true,
+    relayOptions: undefined,
+    signal: undefined,
+    settings: {},
+    log: makeLog(),
+    handleSingleModel: async (_body: unknown, modelStr: string) => {
+      calls.push(modelStr);
+      if (modelStr.includes("claude-opus")) {
+        return Response.json(
+          { error: { message: "quota exhausted for claude-opus-4-6-thinking" } },
+          { status: 429 }
+        );
+      }
+      return okResponse(modelStr);
+    },
+  });
+
+  assert.equal(response.status, 200);
+  assert.equal(calls.at(-1), "antigravity/gemini-3.7-flash-high");
+  assert.ok(
+    calls.includes("antigravity/claude-opus-4-6-thinking"),
+    "first passthrough model should be attempted before fallback"
+  );
 });
